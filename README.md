@@ -1,53 +1,93 @@
-# Rakis connector
+# Rakis server connector
 
-Install the passive server connector without access to Rakis's private repository.
+Connect your server to Rakis, keep it visible after logout, and review optional
+configuration warnings in your dashboard. The connector runs as your normal user
+and manages only its own connection service. It cannot apply fixes or control your
+server's workloads.
+
+## Install or upgrade
+
 Requires Python 3.12+ and [pipx](https://pipx.pypa.io/stable/installation/).
 
 ```sh
-pipx install https://github.com/rebehzat/rakis-connector/releases/download/v0.2.0/rakis_connector-0.2.0-py3-none-any.whl
+pipx install https://github.com/rebehzat/rakis-connector/releases/download/v0.3.0/rakis_connector-0.3.0-py3-none-any.whl
 ```
 
-In your Rakis dashboard, add a server and create a connection key. To inspect
-configuration, enable **Include configuration checks** for that key, then run:
+If you already installed the connector, use `pipx install --force` with the same
+URL, then restart it with `rakis background start`. Your saved connection stays
+on your server. Wheels and SHA-256 checksums are available in
+[Releases](https://github.com/rebehzat/rakis-connector/releases).
+
+## Connect and keep running
+
+Add your server in the dashboard and create a connection key. Run:
 
 ```sh
-rakis connect --api-url https://api.rakis.com.tr --config-root /etc --watch
+rakis connect --api-url https://api.rakis.com.tr
+rakis background start
+rakis background status
 ```
 
-Enter the key at the masked prompt. Use your own HTTPS API address for self-hosted
-Rakis. Omit `--config-root` for connection updates only. Repeat the option to choose
-up to eight configuration folders.
+Enter the key at the masked prompt. For self-hosted Rakis, use your own HTTPS API
+address. Do not put connection keys in command arguments or issues.
 
-The connector reads local configuration and sends fixed risk identifiers plus file
-metadata. Raw contents, environment values, password values and matched text stay
-on the server. It does not execute commands, change configuration, or control the
-server. The dashboard handles findings and revoking access.
+Background operation requires Linux with systemd. Do not use sudo: the service runs
+with your account's permissions, and credentials stay in a private saved file.
+The connector verifies user lingering so it can survive logout and start after a
+reboot. If your host permits it, lingering is enabled for your own account without
+root. Some hosts require an administrator to enable it once; the connector explains
+that requirement rather than claiming it can stay running without it.
 
-Supported filenames include dotenv, YAML, JSON, TOML, INI, nginx, Apache, systemd,
-Docker, Kubernetes, Terraform and XML. Checks cover common risky patterns, including
-embedded credentials, insecure permissions, disabled TLS, debug mode, wildcard CORS,
-privileged containers and public listeners. They are bounded heuristic checks, not
-an exhaustive security assessment. Skipped files and partial coverage are reported.
-Configuration inspection currently requires POSIX safe file access.
+## Optional configuration and AI review
 
-The default limits are 250 files, 256 KiB per file and 16 MiB per inspection. Symlinks,
-hardlinks, private key files, binary files and virtual system roots are excluded.
-No raw configuration is uploaded and these checks make no paid AI calls.
+Enable **Include configuration checks** when creating the key, then choose a folder:
+
+```sh
+rakis connect --api-url https://api.rakis.com.tr --config-root /path/to/configuration --ai
+rakis background start
+```
+
+Omit `--ai` for local rule checks only. Repeat `--config-root` for up to eight folders.
+The connector reads only files your account can access. It recognizes common
+configuration formats and reports bounded heuristic warnings, including insecure
+permissions, credential-like assignments, disabled TLS, debug settings, permissive
+CORS, privileged containers and public listeners. Skipped files remain outside its
+coverage; these checks do not establish complete server security.
+
+Raw configuration, passwords, environment values and matching text stay local.
+Rakis receives fixed warning identifiers and limited file metadata. Optional AI
+receives anonymous warning identifiers, without file contents or filenames, and
+adds guidance for recorded warnings. It uses your workspace's AI token allowance
+and never executes fixes. Follow its queued or completed result in the dashboard.
+
+To request one AI review using your saved folders:
+
+```sh
+rakis scan --ai
+```
+
+This can retry an incomplete AI review after the service is restored. Reviews that
+are already queued, running or successful remain deduplicated. Background checks
+never automatically retry incomplete AI, so unchanged observations do not repeatedly
+spend tokens. A one-time `scan --ai` does not enable AI for future background checks.
+
+## Check or stop
 
 ```sh
 rakis status
+rakis background stop
 rakis disconnect
 ```
 
-`disconnect` removes the saved local key; stop the running connector and revoke its
-key in the dashboard to end access completely. Tokens expire and remain bound to
-one server. Existing `acsc` installations expose the same commands after upgrading;
-the old scan/control commands have been removed.
+`status` checks the saved connection once. `background stop` stops only the connector
+and keeps its key. `disconnect` stops the managed background connector before
+removing its saved key. Stop any separately started foreground connector with Ctrl+C
+and revoke the key in the dashboard to remove access completely.
 
-Download the wheel and SHA-256 checksum from [Releases](https://github.com/rebehzat/rakis-connector/releases).
-Only the client distribution is public here. The Rakis backend repository stays
-private. Public installation is separate from server API access: connecting requires
-a Rakis backend release that supports connection/configuration tokens.
+`rakis run` starts the saved connection in your current terminal; closing that
+terminal stops it. To inspect background status, use `systemctl --user status
+rakis-connector` or `journalctl --user -u rakis-connector`.
 
-Proprietary software, all rights reserved. Public distribution is not an open-source
-license. Do not share connection keys in issues or command arguments.
+Only the client distribution is public here. The server API requires a valid
+connection key. Proprietary software, all rights reserved; public distribution is
+not an open-source license.
