@@ -91,3 +91,26 @@ rakis-connector` or `journalctl --user -u rakis-connector`.
 Only the client distribution is public here. The server API requires a valid
 connection key. Proprietary software, all rights reserved; public distribution is
 not an open-source license.
+
+
+## Develop and build
+
+The source here is the standalone connector. Python 3.12+ is required.
+
+```sh
+python -m venv .venv
+. .venv/bin/activate
+python -m pip install -e '.[dev]'
+python build_public_release.py
+python -m pytest
+python -m ruff check .
+```
+
+The build writes an allowlist-checked wheel, SHA-256 checksum, and release metadata
+to `dist/`. It does not publish a release. The `acsc_cli` module and legacy `acsc`
+entry point remain compatible with existing installations. Tests use synthetic
+fixtures and mocked API/service calls; no Rakis account is required.
+
+Public source availability does not grant an open-source license. The existing
+proprietary terms remain in effect. Server AI prompts, model routing, analysis
+pipelines, scan engines, customer data and deployment configuration are excluded.

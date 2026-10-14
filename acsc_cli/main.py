@@ -1,0 +1,168 @@
+"""Public server connector. All security actions belong in the dashboard."""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+from pydantic import SecretStr
+
+from acsc_cli.background import BackgroundError, manage, stop_if_installed
+from acsc_cli.client import Client, ClientError
+from acsc_cli.config import Config, disconnect, load, save
+from acsc_cli.configuration import inspect
+
+
+def _interval(value: str) -> int:
+    try:
+        interval = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("interval must be between 30 and 300 seconds") from None
+    if not 30 <= interval <= 300:
+        raise argparse.ArgumentTypeError("interval must be between 30 and 300 seconds")
+    return interval
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="rakis", description="Connect this server to Rakis. Manage security in your dashboard."
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+        / "rakis"
+        / "config.json",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    connect = sub.add_parser("connect", help="connect with a server token from the dashboard")
+    connect.add_argument("--api-url", required=True)
+    connect.add_argument("--allow-local-http", action="store_true")
+    connect.add_argument("--no-store", action="store_true")
+    connect.add_argument(
+        "--config-root",
+        action="append",
+        default=[],
+        help="opt in to read-only local configuration checks in this folder",
+    )
+    connect.add_argument(
+        "--watch", action="store_true", help="keep the connection alive until stopped"
+    )
+    connect.add_argument("--interval", type=_interval, default=60)
+    connect.add_argument(
+        "--ai", action="store_true", help="opt in to AI review of safe configuration warnings"
+    )
+    scan = sub.add_parser(
+        "scan", help="inspect saved configuration folders; never scan server networks"
+    )
+    scan.add_argument(
+        "--ai", action="store_true", help="request AI review of safe warnings for this check"
+    )
+    run = sub.add_parser("run", help="keep a saved connection alive in the foreground")
+    run.add_argument("--interval", type=_interval, default=60)
+    background = sub.add_parser("background", help="manage your non-root background connector")
+    background.add_argument("action", choices=["start", "status", "stop"])
+    background.add_argument("--interval", type=_interval, default=60)
+    sub.add_parser("status", help="check the saved connection without starting any work")
+    sub.add_parser("disconnect", help="remove the local token; revoke it in the dashboard")
+    args = parser.parse_args(argv)
+    client = None
+    try:
+        if args.command == "background":
+            print(json.dumps(manage(args.action, args.config, args.interval)))
+            return 0
+        if args.command == "scan":
+            cfg = load(args.config, use_environment=False)
+            if not cfg.config_roots:
+                raise BackgroundError(
+                    "Select configuration folders first with connect --config-root"
+                )
+            client = Client(cfg)
+            print(
+                json.dumps(
+                    client.configuration(
+                        inspect(cfg.config_roots),
+                        ai=args.ai or cfg.ai_configuration,
+                        retry_ai=args.ai,
+                    )
+                )
+            )
+            return 0
+        if args.command == "disconnect":
+            stop_if_installed(args.config)
+            disconnect(args.config)
+            print(json.dumps({"disconnected": True, "token_revocation": "dashboard"}))
+            return 0
+        if args.command in {"connect", "run"}:
+            if args.command == "connect":
+                if args.ai and not args.config_root:
+                    raise BackgroundError(
+                        "AI review requires a chosen folder: use --config-root with --ai"
+                    )
+                credential = SecretStr(
+                    os.environ.get("RAKIS_CONNECT_TOKEN")
+                    or getpass.getpass("Server connection token: ")
+                )
+                cfg = Config(
+                    api_url=args.api_url,
+                    token=credential,
+                    allow_local_http=args.allow_local_http,
+                    config_roots=args.config_root,
+                    ai_configuration=args.ai,
+                )
+            else:
+                cfg = load(args.config, use_environment=False)
+            observations = inspect(cfg.config_roots) if cfg.config_roots else None
+            client = Client(cfg)
+            result = client.heartbeat()
+            if args.command == "connect" and not args.no_store:
+                save(args.config, cfg)
+            print(
+                json.dumps({**result, "stored": args.command == "run" or not args.no_store}),
+                flush=True,
+            )
+            if observations is not None:
+                print(
+                    json.dumps(client.configuration(observations, ai=cfg.ai_configuration)),
+                    flush=True,
+                )
+            while args.command == "run" or args.watch:
+                time.sleep(args.interval)
+                print(json.dumps(client.heartbeat()), flush=True)
+                if cfg.config_roots:
+                    current = inspect(cfg.config_roots)
+                    if current != observations:
+                        print(
+                            json.dumps(client.configuration(current, ai=cfg.ai_configuration)),
+                            flush=True,
+                        )
+                        observations = current
+            return 0
+        client = Client(load(args.config))
+        print(json.dumps(client.status()))
+        return 0
+    except ClientError as exc:
+        print(json.dumps({"error": str(exc)}), file=sys.stderr)
+        return exc.code
+    except (OSError, ValueError, EOFError) as exc:
+        print(
+            json.dumps(
+                {
+                    "error": str(exc)
+                    if isinstance(exc, BackgroundError)
+                    else "Invalid or unavailable connection configuration"
+                }
+            ),
+            file=sys.stderr,
+        )
+        return 2
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        if client:
+            client.close()

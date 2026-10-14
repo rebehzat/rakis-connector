@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "rakis-connector"
+version = "0.3.0"
+requires-python = ">=3.12"
+description = "Connect a server to the Rakis dashboard without remote control"
+readme = "README.md"
+license = {text = "Proprietary - All rights reserved"}
+dependencies = ["httpx>=0.28,<1", "pydantic>=2.7,<3"]
+[project.scripts]
+rakis = "acsc_cli.main:main"
+acsc = "acsc_cli.main:main"
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["acsc_cli*"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "ruff>=0.11,<1", "setuptools>=69"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
