@@ -38,6 +38,11 @@ reboot. If your host permits it, lingering is enabled for your own account witho
 root. Some hosts require an administrator to enable it once; the connector explains
 that requirement rather than claiming it can stay running without it.
 
+Before enabling lingering, start checks the user service directory. If your account
+owns it, the connector adds owner access and removes group/other write permission.
+If another account owns it, the error reports the owner and gives a command to repair
+only that directory. Run `rakis` again as your normal user, without `sudo`.
+
 ## Optional configuration and AI review
 
 Enable **Include configuration checks** when creating the key, then choose a folder:
