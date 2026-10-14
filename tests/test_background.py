@@ -2,6 +2,7 @@
 
 import json
 import os
+import stat
 import subprocess
 
 import pytest
@@ -36,6 +37,51 @@ def service(tmp_path, monkeypatch):
 
     monkeypatch.setattr(background, "_command", command)
     return calls, lingering
+
+
+def test_prepare_service_directory_creates_private_directory(tmp_path, monkeypatch):
+    monkeypatch.setattr(background.os, "getuid", lambda: os.stat(tmp_path).st_uid)
+    directory = tmp_path / "nested" / "systemd" / "user"
+
+    background._prepare_service_directory(directory)
+
+    assert directory.is_dir()
+    assert stat.S_IMODE(directory.stat().st_mode) & 0o077 == 0
+
+
+def test_prepare_service_directory_repairs_owned_permissions(tmp_path, monkeypatch):
+    monkeypatch.setattr(background.os, "getuid", lambda: os.stat(tmp_path).st_uid)
+    directory = tmp_path / "user"
+    directory.mkdir(mode=0o777)
+    directory.chmod(0o777)
+
+    background._prepare_service_directory(directory)
+
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o755
+
+
+def test_prepare_service_directory_refuses_symlink(tmp_path, monkeypatch):
+    monkeypatch.setattr(background.os, "getuid", lambda: os.stat(tmp_path).st_uid)
+    real = tmp_path / "real"
+    real.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(background.BackgroundError, match="real directory"):
+        background._prepare_service_directory(linked)
+
+
+def test_prepare_service_directory_refuses_foreign_owner_without_chmod(tmp_path, monkeypatch):
+    directory = tmp_path / "user"
+    directory.mkdir(mode=0o777)
+    directory.chmod(0o777)
+    before = stat.S_IMODE(directory.stat().st_mode)
+    monkeypatch.setattr(background.os, "getuid", lambda: directory.stat().st_uid + 1)
+
+    with pytest.raises(background.BackgroundError, match="owned by UID"):
+        background._prepare_service_directory(directory)
+
+    assert stat.S_IMODE(directory.stat().st_mode) == before
 
 
 def test_non_root_start_installs_private_secret_free_unit(service, tmp_path, monkeypatch):

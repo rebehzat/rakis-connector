@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -59,6 +60,66 @@ def _unit_path() -> Path:
     )
 
 
+def _prepare_service_directory(directory: Path) -> None:
+    """Create the user unit directory and repair unsafe permissions we own."""
+    uid = os.getuid()
+    try:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        if not isinstance(exc, FileExistsError):
+            raise BackgroundError(
+                f"Could not prepare the user service directory {directory}: "
+                f"{exc.strerror or 'permission denied'}"
+            ) from exc
+    try:
+        info = directory.lstat()
+    except OSError as exc:
+        raise BackgroundError(
+            f"Could not inspect the user service directory {directory}: "
+            f"{exc.strerror or 'permission denied'}"
+        ) from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise BackgroundError(f"The user service directory must be a real directory: {directory}")
+    if info.st_uid != uid:
+        repair = f"sudo chown {uid} -- {shlex.quote(str(directory))}"
+        raise BackgroundError(
+            f"The user service directory {directory} is owned by UID {info.st_uid}; "
+            f"this connector runs as UID {uid}. After confirming the path belongs "
+            f"to your account, fix only this directory with `{repair}`, then retry "
+            "as your normal user without sudo."
+        )
+
+    mode = stat.S_IMODE(info.st_mode)
+    safe_mode = (mode | 0o700) & ~0o022
+    if mode != safe_mode:
+        try:
+            os.chmod(directory, safe_mode, follow_symlinks=False)
+        except (NotImplementedError, OSError) as exc:
+            repair = f"chmod u+rwx,go-w -- {shlex.quote(str(directory))}"
+            raise BackgroundError(
+                f"The user service directory {directory} must not be writable by "
+                f"other users. After confirming it is still a real directory, fix "
+                f"its permissions with `{repair}`, then retry."
+            ) from exc
+        try:
+            info = directory.lstat()
+        except OSError as exc:
+            raise BackgroundError(
+                f"Could not recheck the user service directory {directory}: "
+                f"{exc.strerror or 'permission denied'}"
+            ) from exc
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != uid
+            or info.st_mode & 0o022
+        ):
+            raise BackgroundError(
+                f"The user service directory {directory} is still unsafe after "
+                "permission repair; inspect its owner and permissions, then retry."
+            )
+
+
 def _linger() -> bool:
     result = _command("loginctl", "show-user", str(os.getuid()), "--property=Linger", "--value")
     return result.returncode == 0 and result.stdout.strip() == "yes"
@@ -113,6 +174,11 @@ def manage(action: str, config: Path, interval: int) -> dict[str, object]:
     quoted_config = _quote(str(config))
     quoted_executable = _quote(executable)
     load(config, use_environment=False)
+    target = _unit_path()
+    directory = target.parent
+    _prepare_service_directory(directory)
+    if target.exists() or target.is_symlink():
+        _owned_unit(target)
     if not _linger():
         enabled = _command("loginctl", "enable-linger", str(os.getuid()))
         if enabled.returncode or not _linger():
@@ -121,16 +187,6 @@ def manage(action: str, config: Path, interval: int) -> dict[str, object]:
                 "Ask its administrator to enable lingering for your account; then retry. "
                 "The connector itself runs without root."
             )
-    target = _unit_path()
-    directory = target.parent
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    info = directory.stat()
-    if directory.is_symlink() or info.st_uid != os.getuid() or info.st_mode & 0o022:
-        raise BackgroundError(
-            "The user service directory must be owned by you and not writable by others"
-        )
-    if target.exists() or target.is_symlink():
-        _owned_unit(target)
     unit = (
         "# Managed by the Rakis passive connector\n[Unit]\nDescription=Rakis server connection\n"
         "[Service]\nType=simple\n"
