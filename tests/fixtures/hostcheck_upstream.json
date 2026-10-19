@@ -1,0 +1,9 @@
+{
+  "repository": "rebehzat/acsc-AI",
+  "path": "backend/common/acsc_hostcheck",
+  "commit": "ca688d2f9ef2656c670e9e104b3a809623e462b2",
+  "sha256": {
+    "collector.py": "bf1a24603490312379372cefaf53a71267fa14eaa733ee9f6737c49dd038cb93",
+    "parsers.py": "2df4e72129abf23199a6b6cedcce61c21af47e1739ebabb93512cf999be528e7"
+  }
+}
