@@ -399,13 +399,47 @@ def test_agent_tick_runs_periodically_and_survives_errors(monkeypatch, capsys):
     assert "unavailable" in capsys.readouterr().err
 
 
+LOCAL_IMPORT = "from acsc_cli.hostcheck import"
+SERVER_IMPORT = "from acsc_hostcheck import"
+PIN = Path(__file__).resolve().parent / "fixtures" / "hostcheck_upstream.json"
+
+
+def server_form(name: str) -> bytes:
+    """The vendored file as it reads in the server repository."""
+    text = (Path(agent.__file__).parent / "hostcheck" / name).read_text()
+    return text.replace(LOCAL_IMPORT, SERVER_IMPORT).encode()
+
+
+def test_vendored_collector_matches_pinned_server_hashes():
+    """Runs in every connector CI job: any local edit to the vendored collector
+    fails unless the server copy changes too and this pin is updated with it.
+    The server repository pins the same hashes (backend/common/acsc_hostcheck)."""
+    import hashlib
+
+    pin = json.loads(PIN.read_text())
+    assert set(pin["sha256"]) == {"collector.py", "parsers.py"}
+    for name, digest in pin["sha256"].items():
+        assert hashlib.sha256(server_form(name)).hexdigest() == digest, (
+            f"acsc_cli/hostcheck/{name} drifted from {pin['repository']}@{pin['commit'][:7]}; "
+            "change both copies together and update both pins"
+        )
+    # Only the import path may differ from the server copy.
+    for name in ("collector.py", "parsers.py"):
+        local = (Path(agent.__file__).parent / "hostcheck" / name).read_text()
+        assert SERVER_IMPORT not in local
+
+
 def test_vendored_collector_matches_server_copy():
-    root = os.environ.get("RAKIS_SERVER_SOURCE")
-    if not root:
-        pytest.skip("set RAKIS_SERVER_SOURCE to an acsc-AI checkout to compare")
-    server = Path(root) / "backend/common/acsc_hostcheck"
-    local = Path(agent.__file__).parent / "hostcheck"
-    assert (local / "parsers.py").read_bytes() == (server / "parsers.py").read_bytes()
-    assert (local / "collector.py").read_text().replace(
-        "from acsc_cli.hostcheck import", "from acsc_hostcheck import"
-    ) == (server / "collector.py").read_text()
+    # Next to the server checkout (acsc-AI/.dependencies/connector) or explicit.
+    candidates = [
+        os.environ.get("RAKIS_SERVER_SOURCE", ""),
+        str(Path(__file__).resolve().parents[3]),
+    ]
+    roots = [
+        Path(c) for c in candidates if c and (Path(c) / "backend/common/acsc_hostcheck").is_dir()
+    ]
+    if not roots:
+        pytest.skip("server source not available; the pinned hash test still runs")
+    server = roots[0] / "backend/common/acsc_hostcheck"
+    for name in ("collector.py", "parsers.py"):
+        assert server_form(name) == (server / name).read_bytes()
