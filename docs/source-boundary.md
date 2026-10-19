@@ -5,7 +5,9 @@ tests, standalone packaging code and client documentation. It was copied as a
 file allowlist, without importing private repository history.
 
 Included code implements credential storage, bounded local configuration rules,
-HTTP request/response validation and the connector's user service. Optional AI
+HTTP request/response validation, the connector's user service, opt-in agent
+enrollment and the read-only host checks collector (a fixed command allowlist,
+vendored from the server repository so both sides parse the same way). Optional AI
 flags request server-side review; this repository contains no prompts, provider
 credentials, model selection, agent orchestration or server analysis logic.
 

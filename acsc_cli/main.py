@@ -8,14 +8,20 @@ import json
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 
 from pydantic import SecretStr
 
+from acsc_cli import agent
 from acsc_cli.background import BackgroundError, manage, stop_if_installed
 from acsc_cli.client import Client, ClientError
 from acsc_cli.config import Config, disconnect, load, save
 from acsc_cli.configuration import inspect
+from acsc_cli.hostcheck import collector
+
+HOST_CHECK_EVERY_S = 6 * 3600
+ATTEST_EVERY_S = 24 * 3600
 
 
 def _interval(value: str) -> int:
@@ -26,6 +32,28 @@ def _interval(value: str) -> int:
     if not 30 <= interval <= 300:
         raise argparse.ArgumentTypeError("interval must be between 30 and 300 seconds")
     return interval
+
+
+def _agent_tick(
+    identity: agent.AgentIdentity, last_checks: float, last_attest: float
+) -> tuple[float, float]:
+    """Periodic opt-in agent work. Failures are reported and retried next period."""
+    now = time.monotonic()
+    if now - last_attest >= ATTEST_EVERY_S:
+        last_attest = now
+        try:
+            due = agent.attest(identity)
+            print(json.dumps({"attested": True, "reverify_due_at": due}), flush=True)
+        except ClientError as exc:
+            print(json.dumps({"error": str(exc)}), file=sys.stderr, flush=True)
+    if now - last_checks >= HOST_CHECK_EVERY_S:
+        last_checks = now
+        try:
+            result = agent.publish_host_checks(identity, collector.collect())
+            print(json.dumps({"host_checks": result}), flush=True)
+        except ClientError as exc:
+            print(json.dumps({"error": str(exc)}), file=sys.stderr, flush=True)
+    return last_checks, last_attest
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -68,6 +96,20 @@ def main(argv: list[str] | None = None) -> int:
     background = sub.add_parser("background", help="manage your non-root background connector")
     background.add_argument("action", choices=["start", "status", "stop"])
     background.add_argument("--interval", type=_interval, default=60)
+    enroll = sub.add_parser(
+        "enroll", help="opt in: prove this server's address with a dashboard enrollment token"
+    )
+    enroll.add_argument("--api-url", required=True)
+    enroll.add_argument("--org-id", type=uuid.UUID, required=True)
+    enroll.add_argument("--asset-id", type=uuid.UUID, required=True)
+    enroll.add_argument("--allow-local-http", action="store_true")
+    sub.add_parser("attest", help="re-prove this server's address with the enrolled key")
+    host = sub.add_parser(
+        "host-checks", help="send read-only package, listener, sshd and firewall checks"
+    )
+    host.add_argument(
+        "--dry-run", action="store_true", help="print the report locally and send nothing"
+    )
     sub.add_parser("status", help="check the saved connection without starting any work")
     sub.add_parser("disconnect", help="remove the local token; revoke it in the dashboard")
     args = parser.parse_args(argv)
@@ -92,6 +134,32 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
             )
+            return 0
+        identity_path = agent.default_path(args.config)
+        if args.command == "enroll":
+            credential = SecretStr(
+                os.environ.get("RAKIS_ENROLL_TOKEN") or getpass.getpass("Agent enrollment token: ")
+            )
+            identity = agent.enroll(
+                api_url=args.api_url,
+                org_id=args.org_id,
+                asset_id=args.asset_id,
+                enrollment_token=credential,
+                allow_local_http=args.allow_local_http,
+            )
+            agent.save_identity(identity_path, identity)
+            print(json.dumps({"enrolled": True, "asset_id": str(identity.asset_id)}))
+            return 0
+        if args.command == "attest":
+            due = agent.attest(agent.load_identity(identity_path))
+            print(json.dumps({"attested": True, "reverify_due_at": due}))
+            return 0
+        if args.command == "host-checks":
+            if args.dry_run:
+                print(json.dumps(agent.report(collector.collect())))
+                return 0
+            identity = agent.load_identity(identity_path)
+            print(json.dumps(agent.publish_host_checks(identity, collector.collect())))
             return 0
         if args.command == "disconnect":
             stop_if_installed(args.config)
@@ -131,7 +199,15 @@ def main(argv: list[str] | None = None) -> int:
                     json.dumps(client.configuration(observations, ai=cfg.ai_configuration)),
                     flush=True,
                 )
+            enrolled = (
+                agent.load_identity(identity_path)
+                if args.command == "run" and identity_path.exists()
+                else None
+            )
+            last_checks = last_attest = float("-inf")
             while args.command == "run" or args.watch:
+                if enrolled is not None:
+                    last_checks, last_attest = _agent_tick(enrolled, last_checks, last_attest)
                 time.sleep(args.interval)
                 print(json.dumps(client.heartbeat()), flush=True)
                 if cfg.config_roots:
