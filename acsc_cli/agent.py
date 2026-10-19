@@ -15,8 +15,11 @@ import base64
 import json
 import os
 import re
+import socket
 import stat
 import tempfile
+import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -34,6 +37,8 @@ ENROLLMENT_TOKEN = re.compile(r"^acsc_e_[0-9a-f]{12}_[A-Za-z0-9_-]{43}$")
 CHALLENGE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 ENROLLMENT_KIND = "rakis-agent-enrollment-v1"
 ATTESTATION_KIND = "rakis-agent-attestation-v1"
+REACHABILITY_KIND = "rakis-agent-reachability-v1"
+REACHABILITY_PORTS = range(47800, 47900)
 MAX_RESPONSE = 16384
 
 
@@ -48,6 +53,8 @@ class AgentIdentity(BaseModel):
     allow_local_http: bool = False
     # Opt in: use the sudoers drop-in for root-only read queries (see README).
     sudo_queries: bool = False
+    # Opt in: re-run the inbound reachability check from background runs.
+    reachability_checks: bool = False
 
     @field_validator("token")
     @classmethod
@@ -139,9 +146,9 @@ def _http(api_url: str, bearer: str, transport: httpx.BaseTransport | None) -> h
     )
 
 
-def _post(http: httpx.Client, path: str, body: dict[str, Any]) -> dict[str, Any]:
+def _post(http: httpx.Client, path: str, body: dict[str, Any] | None) -> dict[str, Any]:
     try:
-        with http.stream("POST", path, json=body) as response:
+        with http.stream("POST" if body is not None else "GET", path, json=body) as response:
             if response.status_code in {401, 403}:
                 raise ClientError(3, "Agent credential rejected or not allowed for this action")
             if response.status_code == 409:
@@ -349,6 +356,7 @@ def save_identity(path: Path, identity: AgentIdentity) -> None:
                     "private_key": identity.private_key.get_secret_value(),
                     "allow_local_http": identity.allow_local_http,
                     "sudo_queries": identity.sudo_queries,
+                    "reachability_checks": identity.reachability_checks,
                 },
                 stream,
             )
@@ -357,3 +365,104 @@ def save_identity(path: Path, identity: AgentIdentity) -> None:
         os.replace(name, path)
     finally:
         Path(name).unlink(missing_ok=True)
+
+
+class _Listener:
+    """Serve one fixed line to whoever connects, until closed. Reads nothing."""
+
+    def __init__(self, host: str, port: int, line: bytes) -> None:
+        self.line = line
+        self.sock = socket.create_server((host, port), reuse_port=False)
+        self.sock.settimeout(0.5)
+        self.stop = threading.Event()
+        self.served = 0
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _serve(self) -> None:
+        while not self.stop.is_set():
+            try:
+                conn, _ = self.sock.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            with conn:
+                try:
+                    conn.settimeout(2)
+                    conn.sendall(self.line)
+                    self.served += 1
+                except OSError:
+                    pass
+
+    def close(self) -> None:
+        self.stop.set()
+        self.sock.close()
+        self.thread.join(timeout=2)
+
+
+def reachability(
+    identity: AgentIdentity,
+    *,
+    transport: httpx.BaseTransport | None = None,
+    host: str = "0.0.0.0",  # noqa: S104 - must accept the verifier's inbound connection
+    wait_s: float = 60,
+    poll_s: float = 2,
+) -> dict[str, Any]:
+    """Prove the address reaches this server inbound on the port the server picks."""
+    key = identity.key()
+    with _http(identity.api_url, identity.token.get_secret_value(), transport) as http:
+        issued = _post(http, "/agent/v1/reachability/challenge", {})
+        try:
+            check_id = str(uuid.UUID(issued["reachability_id"]))
+            port = issued["port"]
+            nonce = issued["nonce"]
+            observed = issued["observed_ip"]
+            if (
+                issued.get("sign") != REACHABILITY_KIND
+                or type(port) is not int
+                or port not in REACHABILITY_PORTS
+                or not isinstance(nonce, str)
+                or not CHALLENGE.fullmatch(nonce)
+                or not isinstance(observed, str)
+                or len(observed) > 45
+                or str(uuid.UUID(issued["enrollment_id"])) != str(identity.enrollment_id)
+            ):
+                raise ValueError
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise ClientError(4, "Invalid reachability challenge") from None
+        message = signed_document(
+            REACHABILITY_KIND,
+            org_id=str(identity.org_id),
+            asset_id=str(identity.asset_id),
+            enrollment_id=str(identity.enrollment_id),
+            observed_ip=observed,
+            challenge=nonce,
+            public_key=public_key(key),
+        )
+        line = f"{REACHABILITY_KIND} {sign(key, message)}\n".encode()
+        try:
+            listener = _Listener(host, port, line)
+        except OSError:
+            raise ClientError(4, f"Could not listen on TCP port {port}") from None
+        try:
+            _post(http, "/agent/v1/reachability/ready", {"reachability_id": check_id})
+            deadline = time.monotonic() + wait_s
+            while True:
+                status = _post(http, f"/agent/v1/reachability/{check_id}", None)
+                if status.get("status") in {"succeeded", "failed"}:
+                    break
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(poll_s)
+        finally:
+            listener.close()
+    keys = ("reachability_id", "status", "port", "valid_until", "failure_reason")
+    result = {name: status.get(name) for name in keys}
+    if result["status"] not in {"succeeded", "failed", "ready"}:
+        raise ClientError(4, "Invalid reachability response")
+    for name in ("valid_until", "failure_reason"):
+        value = result[name]
+        if value is not None and (not isinstance(value, str) or len(value) > 64):
+            raise ClientError(4, "Invalid reachability response")
+    return result

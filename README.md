@@ -107,6 +107,21 @@ Queries that need root report "not collected" when the connector runs as a norma
 user, unless you opt in to the sudoers drop-in below. When enrolled, `rakis run` (and the background service) attests once a day
 and sends host checks every six hours.
 
+### Inbound reachability (for agent-proof port checks)
+
+Port checks on a server proven only by enrollment also need proof that the
+address reaches this server inbound (not just a shared NAT it sends through):
+
+```bash
+rakis reachability            # one check; exit 0 on success
+rakis reachability --remember # after a success, repeat it daily from background runs
+```
+
+The dashboard picks a port in 47800-47899 and a one-time nonce. The connector
+listens on that port for up to a minute, serves one signed line to whoever
+connects, reads nothing and closes. Allow inbound TCP 47800-47899 to this
+server while the check runs. The dashboard never sends a target or command.
+
 ### Optional: root-only queries without running as root
 
 `sshd -T`, `nft`, `ufw` and `iptables` need root. The connector never runs as

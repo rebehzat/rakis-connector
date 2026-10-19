@@ -51,6 +51,11 @@ def _agent_tick(
             print(json.dumps({"attested": True, "reverify_due_at": due}), flush=True)
         except ClientError as exc:
             print(json.dumps({"error": str(exc)}), file=sys.stderr, flush=True)
+        if identity.reachability_checks:
+            try:
+                print(json.dumps({"reachability": agent.reachability(identity)}), flush=True)
+            except ClientError as exc:
+                print(json.dumps({"error": str(exc)}), file=sys.stderr, flush=True)
     if now - last_checks >= HOST_CHECK_EVERY_S:
         last_checks = now
         try:
@@ -109,6 +114,13 @@ def main(argv: list[str] | None = None) -> int:
     enroll.add_argument("--asset-id", type=uuid.UUID, required=True)
     enroll.add_argument("--allow-local-http", action="store_true")
     sub.add_parser("attest", help="re-prove this server's address with the enrolled key")
+    reach = sub.add_parser(
+        "reachability",
+        help="prove the address reaches this server inbound (needed for agent-proof port checks)",
+    )
+    reach.add_argument(
+        "--remember", action="store_true", help="also re-run it daily from background runs"
+    )
     host = sub.add_parser(
         "host-checks", help="send read-only package, listener, sshd and firewall checks"
     )
@@ -171,6 +183,15 @@ def main(argv: list[str] | None = None) -> int:
             due = agent.attest(agent.load_identity(identity_path))
             print(json.dumps({"attested": True, "reverify_due_at": due}))
             return 0
+        if args.command == "reachability":
+            identity = agent.load_identity(identity_path)
+            result = agent.reachability(identity)
+            if args.remember and result["status"] == "succeeded":
+                agent.save_identity(
+                    identity_path, identity.model_copy(update={"reachability_checks": True})
+                )
+            print(json.dumps(result))
+            return 0 if result["status"] == "succeeded" else 4
         if args.command == "sudoers-file":
             print(privileged.sudoers_text(args.user or getpass.getuser()), end="")
             return 0
