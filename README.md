@@ -76,6 +76,37 @@ are already queued, running or successful remain deduplicated. Background checks
 never automatically retry incomplete AI, so unchanged observations do not repeatedly
 spend tokens. A one-time `scan --ai` does not enable AI for future background checks.
 
+## Optional agent enrollment and host checks
+
+Enrollment is opt in. It proves to the dashboard that this server controls its own
+public address, and lets the connector send read-only host checks. Create an
+enrollment token for the server in the dashboard, then run on that server:
+
+```bash
+rakis enroll --api-url https://api.example --org-id ORG_ID --asset-id ASSET_ID
+```
+
+The token is read from a masked prompt (or `RAKIS_ENROLL_TOKEN`). The connector
+generates an Ed25519 key on this server, signs the one-time challenge the
+dashboard issues for the address it sees, and stores the key and the released
+agent token in a private `agent.json` (0600) next to `config.json`. Neither is ever
+printed.
+
+```bash
+rakis host-checks --dry-run   # print the report locally, send nothing
+rakis host-checks             # send the report to the dashboard
+rakis attest                  # re-prove the address before it lapses
+```
+
+Host checks run only a fixed list of read-only queries (`dpkg-query` or `rpm`,
+`ss`, `sshd -T`, `nft`, `ufw`, `iptables`) with no shell, a minimal environment,
+a timeout and an output cap. The dashboard never sends commands and nothing in a
+response decides what runs. Only installed package names and versions, listening
+sockets, an allowlist of effective sshd settings and a firewall summary are sent.
+Queries that need root report "not collected" when the connector runs as a normal
+user. When enrolled, `rakis run` (and the background service) attests once a day
+and sends host checks every six hours.
+
 ## Check or stop
 
 ```sh

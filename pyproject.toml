@@ -8,7 +8,7 @@ requires-python = ">=3.12"
 description = "Connect a server to the Rakis dashboard without remote control"
 readme = "README.md"
 license = {text = "Proprietary - All rights reserved"}
-dependencies = ["httpx>=0.28,<1", "pydantic>=2.7,<3"]
+dependencies = ["cryptography>=43,<47", "httpx>=0.28,<1", "pydantic>=2.7,<3"]
 [project.scripts]
 rakis = "acsc_cli.main:main"
 acsc = "acsc_cli.main:main"
