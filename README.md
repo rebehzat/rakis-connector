@@ -104,8 +104,34 @@ a timeout and an output cap. The dashboard never sends commands and nothing in a
 response decides what runs. Only installed package names and versions, listening
 sockets, an allowlist of effective sshd settings and a firewall summary are sent.
 Queries that need root report "not collected" when the connector runs as a normal
-user. When enrolled, `rakis run` (and the background service) attests once a day
+user, unless you opt in to the sudoers drop-in below. When enrolled, `rakis run` (and the background service) attests once a day
 and sends host checks every six hours.
+
+### Optional: root-only queries without running as root
+
+`sshd -T`, `nft`, `ufw` and `iptables` need root. The connector never runs as
+root and never changes sudo configuration. If you want those sections, you can
+install a sudoers drop-in yourself that allows your connector user to run
+exactly these four read-only command lines and nothing else:
+
+```text
+USER ALL=(root) NOPASSWD: /usr/sbin/sshd -T, /usr/sbin/nft list ruleset, /usr/sbin/ufw status verbose, /usr/sbin/iptables -S
+```
+
+```bash
+rakis sudoers-file > rakis-hostcheck          # prints the drop-in for your user; writes nothing
+sudo visudo -cf rakis-hostcheck               # syntax check
+sudo install -m 0440 -o root -g root rakis-hostcheck /etc/sudoers.d/rakis-hostcheck
+rakis host-checks --dry-run --sudo-queries on # see what would be sent
+rakis host-checks --sudo-queries on --remember  # also use it for background runs
+```
+
+`docs/sudoers/rakis-hostcheck.example` is the same file for the user `rakis`.
+Check the program paths with `command -v sshd nft ufw iptables` first; a
+program at another path is simply not granted. The connector calls only
+`/usr/bin/sudo -n -- <one of the four lines>`, never prompts, and falls back
+to the unprivileged attempt when sudo is not granted. Remove the file with
+`sudo rm /etc/sudoers.d/rakis-hostcheck` to stop.
 
 ## Check or stop
 

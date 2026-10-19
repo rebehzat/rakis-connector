@@ -1,0 +1,5 @@
+# Rakis connector read-only host checks (optional, installed by you).
+# Install: sudo visudo -cf FILE && sudo install -m 0440 -o root -g root FILE /etc/sudoers.d/rakis-hostcheck
+# Remove:  sudo rm /etc/sudoers.d/rakis-hostcheck
+# Grants exactly these read-only command lines as root, with no other arguments.
+rakis ALL=(root) NOPASSWD: /usr/sbin/sshd -T, /usr/sbin/nft list ruleset, /usr/sbin/ufw status verbose, /usr/sbin/iptables -S

@@ -10,6 +10,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 from pydantic import SecretStr
 
@@ -18,7 +19,7 @@ from acsc_cli.background import BackgroundError, manage, stop_if_installed
 from acsc_cli.client import Client, ClientError
 from acsc_cli.config import Config, disconnect, load, save
 from acsc_cli.configuration import inspect
-from acsc_cli.hostcheck import collector
+from acsc_cli.hostcheck import collector, privileged
 
 HOST_CHECK_EVERY_S = 6 * 3600
 ATTEST_EVERY_S = 24 * 3600
@@ -32,6 +33,10 @@ def _interval(value: str) -> int:
     if not 30 <= interval <= 300:
         raise argparse.ArgumentTypeError("interval must be between 30 and 300 seconds")
     return interval
+
+
+def _collect(use_sudo: bool) -> dict[str, Any]:
+    return collector.collect(privileged.runner()) if use_sudo else collector.collect()
 
 
 def _agent_tick(
@@ -49,7 +54,7 @@ def _agent_tick(
     if now - last_checks >= HOST_CHECK_EVERY_S:
         last_checks = now
         try:
-            result = agent.publish_host_checks(identity, collector.collect())
+            result = agent.publish_host_checks(identity, _collect(identity.sudo_queries))
             print(json.dumps({"host_checks": result}), flush=True)
         except ClientError as exc:
             print(json.dumps({"error": str(exc)}), file=sys.stderr, flush=True)
@@ -110,6 +115,18 @@ def main(argv: list[str] | None = None) -> int:
     host.add_argument(
         "--dry-run", action="store_true", help="print the report locally and send nothing"
     )
+    host.add_argument(
+        "--sudo-queries",
+        choices=["on", "off"],
+        help="use the optional sudoers drop-in for root-only read queries",
+    )
+    host.add_argument(
+        "--remember", action="store_true", help="save --sudo-queries for background runs"
+    )
+    sudoers = sub.add_parser(
+        "sudoers-file", help="print the optional least-privilege sudoers drop-in; installs nothing"
+    )
+    sudoers.add_argument("--user", help="user the connector runs as (default: current user)")
     sub.add_parser("status", help="check the saved connection without starting any work")
     sub.add_parser("disconnect", help="remove the local token; revoke it in the dashboard")
     args = parser.parse_args(argv)
@@ -154,12 +171,29 @@ def main(argv: list[str] | None = None) -> int:
             due = agent.attest(agent.load_identity(identity_path))
             print(json.dumps({"attested": True, "reverify_due_at": due}))
             return 0
+        if args.command == "sudoers-file":
+            print(privileged.sudoers_text(args.user or getpass.getuser()), end="")
+            return 0
         if args.command == "host-checks":
+            if args.remember and args.sudo_queries is None:
+                raise BackgroundError("--remember needs --sudo-queries on or off")
+            stored: agent.AgentIdentity | None = None
+            if not args.dry_run or args.remember or identity_path.exists():
+                stored = agent.load_identity(identity_path)
+            use_sudo = (
+                args.sudo_queries == "on"
+                if args.sudo_queries is not None
+                else bool(stored and stored.sudo_queries)
+            )
+            if stored is not None and args.remember:
+                stored = stored.model_copy(update={"sudo_queries": use_sudo})
+                agent.save_identity(identity_path, stored)
+            report = _collect(use_sudo)
             if args.dry_run:
-                print(json.dumps(agent.report(collector.collect())))
+                print(json.dumps(agent.report(report)))
                 return 0
-            identity = agent.load_identity(identity_path)
-            print(json.dumps(agent.publish_host_checks(identity, collector.collect())))
+            assert stored is not None
+            print(json.dumps(agent.publish_host_checks(stored, report)))
             return 0
         if args.command == "disconnect":
             stop_if_installed(args.config)

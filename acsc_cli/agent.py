@@ -46,6 +46,8 @@ class AgentIdentity(BaseModel):
     token: SecretStr
     private_key: SecretStr
     allow_local_http: bool = False
+    # Opt in: use the sudoers drop-in for root-only read queries (see README).
+    sudo_queries: bool = False
 
     @field_validator("token")
     @classmethod
@@ -346,6 +348,7 @@ def save_identity(path: Path, identity: AgentIdentity) -> None:
                     "token": identity.token.get_secret_value(),
                     "private_key": identity.private_key.get_secret_value(),
                     "allow_local_http": identity.allow_local_http,
+                    "sudo_queries": identity.sudo_queries,
                 },
                 stream,
             )
