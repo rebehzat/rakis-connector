@@ -7,7 +7,6 @@ import pytest
 from pydantic import SecretStr
 
 from acsc_cli import __version__, main
-from acsc_cli.clamav import SignatureIndex
 from acsc_cli.client import Client, ClientError
 from acsc_cli.config import Config, load, save
 
@@ -49,6 +48,13 @@ RESPONSE = {
 }
 
 
+class FakeIndex:
+    """A signature index that finds nothing in the scanned files."""
+
+    def match(self, stream, size):
+        return []
+
+
 class FakeDatabase:
     """A signature database that never reaches the network."""
 
@@ -59,7 +65,7 @@ class FakeDatabase:
         return None
 
     def index(self):
-        return SignatureIndex({}, [])
+        return FakeIndex()
 
     def status(self):
         return dict(REPORT["signature_db"])
@@ -272,6 +278,9 @@ def _sleep_once(monkeypatch):
             raise KeyboardInterrupt
 
     monkeypatch.setattr(main.time, "sleep", sleep)
+    # The device scan repeats on its own slower cadence. The tests drive the
+    # clock, so they ask for the shorter one.
+    monkeypatch.setattr(main, "DEVICE_RESCAN_SECONDS", 0)
 
 
 def test_the_background_loop_repeats_the_device_scan_and_uploads_only_changes(
@@ -308,6 +317,54 @@ def test_the_background_loop_repeats_the_device_scan_and_uploads_only_changes(
     )
     _sleep_once(monkeypatch)
     assert main.main(["--config", str(path), "run"]) == 130
+    assert [request.url.path for request in requests] == [
+        "/agent/v1/heartbeat",
+        "/agent/v1/device-scan",
+        "/agent/v1/heartbeat",
+    ]
+
+
+def test_the_background_loop_waits_for_its_own_cadence_before_rescanning(tmp_path, monkeypatch):
+    chosen = tmp_path / "chosen"
+    chosen.mkdir()
+    (chosen / "readme.txt").write_text("nothing to see here")
+    path = tmp_path / "private" / "config.json"
+    save(
+        path,
+        Config(api_url=CFG.api_url, token=SecretStr(TOKEN), device_paths=[str(chosen)]),
+    )
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if request.url.path == "/agent/v1/device-scan":
+            return httpx.Response(200, json=RESPONSE)
+        return httpx.Response(
+            200,
+            json={
+                "connected": True,
+                "asset_id": ASSET,
+                "name": "My server",
+                "last_seen_at": "2026-10-20T03:12:00+00:00",
+                "server_time": "2026-10-20T03:12:00+00:00",
+            },
+        )
+
+    monkeypatch.setattr(main, "ClamavDatabase", FakeDatabase)
+    monkeypatch.setattr(main, "DEVICE_RESCAN_SECONDS", 600)
+    monkeypatch.setattr(
+        main, "Client", lambda config: Client(config, transport=httpx.MockTransport(handler))
+    )
+    calls = []
+
+    def sleep(delay):
+        calls.append(delay)
+        if len(calls) > 1:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(main.time, "sleep", sleep)
+    assert main.main(["--config", str(path), "run"]) == 130
+    # The scan ran once. The next interval is too short for a second one.
     assert [request.url.path for request in requests] == [
         "/agent/v1/heartbeat",
         "/agent/v1/device-scan",

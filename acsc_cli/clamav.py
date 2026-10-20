@@ -1,26 +1,35 @@
 """Local ClamAV signature matching with the connector's own signature database.
 
-Coverage limitation: this module implements whole-file hash matching (MD5, SHA1
-and SHA256 lookups from .hdb files) and nucleic matching (section hashes from
-.ndb files read at a recorded byte offset). It does not evaluate ClamAV
-bytecode (.cvd and .cld) signatures, does not match .ftm magic files, does not
-unpack archives, does not run heuristic or behavioural analysis, and does not
-use a clamd daemon. A file that only matches a bytecode, magic or heuristic
-signature is not reported here, so a clean device scan is not proof that the
-server is free of malware.
+The connector downloads the ClamAV signature containers (``daily.cvd`` and
+``main.cvd``) from the public signature CDN and keeps the whole-file hash
+databases they carry (``.hdb`` and ``.hsb``). A scanned file is matched by its
+MD5, SHA1 and SHA256 digest. The containers are read as they are published:
+a fixed header, then a gzip compressed tar of the signature files.
 
-The signature database is downloaded from https://database.clamav.net/ and kept
-in a private local cache. Only signature names, relative path labels, file
-sizes and coverage counters leave the device: file content, file hashes and
-the list of scanned files stay local.
+Coverage limitation: this module compares whole-file hashes only. ClamAV's
+pattern (``.ndb``), logical (``.ldb``), bytecode and section-hash engines are
+not evaluated, and the publisher signature of a container is not checked: the
+MD5 that the container header records over its own payload is checked instead.
+A file that only matches a pattern or a bytecode signature is not reported
+here, so a clean device scan is not proof that the server is free of malware.
+
+Only signature names, relative path labels, file sizes and coverage counters
+leave the device: file content, file hashes and the list of scanned files stay
+local.
 """
 
 from __future__ import annotations
 
+import gzip
 import hashlib
+import io
+import json
+import mmap
 import os
 import re
+import shutil
 import stat
+import tarfile
 import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -29,17 +38,24 @@ from typing import Any, BinaryIO
 
 import httpx
 
-DATABASE_URL = "https://database.clamav.net/"
-SIGNATURE_FILES = ("daily.hdb", "daily.ndb", "main.hdb", "main.ndb")
-MAX_FILE_BYTES = 64 * 1024 * 1024
-MAX_TOTAL_BYTES = 256 * 1024 * 1024
+CONTAINER_URL = "https://database.clamav.net/"
+# The signature CDN serves the containers to ClamAV update clients and
+# identifies them by the user agent. The connector uses the same convention
+# and adds its own version, so the download is not mistaken for a browser.
+USER_AGENT = "ClamAV/1.4.3 (rakis-connector)"
+CONTAINERS = ("daily.cvd", "main.cvd")
+HASH_SUFFIXES = (".hdb", ".hsb")
+HEADER_BYTES = 512
+MAX_CONTAINER_BYTES = 256 * 1024 * 1024
+MAX_MEMBER_BYTES = 64 * 1024 * 1024
+MAX_TOTAL_BYTES = 512 * 1024 * 1024
 REFRESH_INTERVAL = timedelta(hours=24)
-MAX_SECTION_OFFSETS = 32
 CHUNK_BYTES = 1024 * 1024
-VALIDATION_BYTES = 512 * 1024
-HASH_ALGORITHMS = {"MD5": "md5", "SHA1": "sha1", "SHA256": "sha256"}
+DIGEST_HEX = re.compile(r"^(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})$")
 HASH_LINE = re.compile(r"^([0-9a-fA-F]{32}|[0-9a-fA-F]{40}|[0-9a-fA-F]{64}):(\d+):(.+)$")
-DIGEST = re.compile(r"^[0-9a-f]{32}$|^[0-9a-f]{40}$|^[0-9a-f]{64}$")
+BUILD_TIME = "%d %b %Y %H-%M %z"
+METADATA_NAME = "database.json"
+INDEX_NAME = "hashes.idx"
 
 
 class ClamavError(ValueError):
@@ -56,20 +72,10 @@ class Match:
 
 @dataclass(frozen=True)
 class HashSignature:
-    """A whole-file hash signature from a .hdb file."""
+    """A whole-file hash signature."""
 
     name: str
     size: int
-
-
-@dataclass(frozen=True)
-class NucleicSignature:
-    """A section hash signature from a .ndb file."""
-
-    name: str
-    algorithm: str
-    offset: int
-    digest: str
 
 
 def default_directory() -> Path:
@@ -78,11 +84,19 @@ def default_directory() -> Path:
     return Path(base) / "rakis" / "clamav"
 
 
-def parse_hdb(text: str) -> dict[str, list[HashSignature]]:
-    """Parse .hdb content into whole-file hash signatures keyed by digest.
+def configured_containers() -> tuple[str, ...]:
+    """The containers to use. ``RAKIS_CLAMAV_DATABASE=daily`` keeps it small."""
+    choice = os.environ.get("RAKIS_CLAMAV_DATABASE", "full").strip().lower()
+    if choice == "daily":
+        return ("daily.cvd",)
+    return CONTAINERS
+
+
+def parse_hashes(text: str) -> dict[str, list[HashSignature]]:
+    """Parse a hash database into signatures keyed by digest.
 
     Each line is ``<hash>:<size>:<name>``. The hash is an MD5, SHA1 or SHA256
-    digest and the size is the file size of the known sample. A size of zero
+    digest and the size is the size of the known sample. A size of zero
     matches any file size.
     """
     index: dict[str, list[HashSignature]] = {}
@@ -98,64 +112,7 @@ def parse_hdb(text: str) -> dict[str, list[HashSignature]]:
     return index
 
 
-def parse_ndb(text: str) -> list[NucleicSignature]:
-    """Parse .ndb content into nucleic section signatures.
-
-    Each line is ``<target>:0:<type>,<offset>,<digest>``. ``MD5``, ``SHA1`` and
-    ``SHA256`` describe the file itself and ``Hash:0``, ``Hash:1`` and
-    ``Hash:2`` describe a section of it; the section hash is an MD5 digest.
-    ``PE`` entries are recognised but not matched.
-    """
-    signatures: list[NucleicSignature] = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parsed = _parse_ndb_line(line)
-        if parsed is not None:
-            signatures.append(parsed)
-    return signatures
-
-
-def _parse_ndb_line(line: str) -> NucleicSignature | None:
-    parts = line.split(":", 2)
-    if len(parts) < 3:
-        return None
-    name, target_type, remainder = parts
-    if target_type != "0":
-        return None
-    tokens = [token for token in re.split(r"[,:]", remainder) if token]
-    if not tokens:
-        return None
-    kind = tokens[0]
-    if kind == "Hash":
-        if len(tokens) < 2 or tokens[1] not in {"0", "1", "2"}:
-            return None
-        algorithm = "md5"
-        position = 2
-    elif kind in HASH_ALGORITHMS:
-        algorithm = HASH_ALGORITHMS[kind]
-        position = 1
-    else:
-        # PE sections and unknown types are not implemented.
-        return None
-    if position < len(tokens) and tokens[position] == "*":
-        position += 1
-    if position >= len(tokens):
-        return None
-    if tokens[position].isdigit():
-        offset = int(tokens[position])
-        digest = tokens[position + 1] if len(tokens) > position + 1 else ""
-    else:
-        offset = 0
-        digest = tokens[position]
-    digest = digest.lower()
-    if not DIGEST.fullmatch(digest):
-        return None
-    return NucleicSignature(name=name, algorithm=algorithm, offset=offset, digest=digest)
-
-
-def _looks_like_hdb(text: str) -> bool:
+def _looks_like_hash_database(text: str) -> bool:
     total = valid = 0
     for line in text.splitlines():
         line = line.strip()
@@ -167,94 +124,136 @@ def _looks_like_hdb(text: str) -> bool:
     return valid > 0 and valid * 2 >= total
 
 
-def _looks_like_ndb(text: str) -> bool:
-    total = valid = 0
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        total += 1
-        if _parse_ndb_line(line) is not None:
-            valid += 1
-    return valid > 0 and valid * 2 >= total
+def _looks_like_hash_database_file(path: Path) -> bool:
+    """Check the format of a hash database without loading it into memory."""
+    with path.open("r", errors="replace") as stream:
+        head = []
+        for _ in range(200):
+            line = stream.readline()
+            if not line:
+                break
+            head.append(line)
+    return _looks_like_hash_database("".join(head))
+
+
+class _HashingReader(io.RawIOBase):
+    """Read a stream and hash every byte that passes through it."""
+
+    def __init__(self, stream: BinaryIO, hasher: Any) -> None:
+        self._stream = stream
+        self._hasher = hasher
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, size: int = -1) -> bytes:
+        block = self._stream.read(CHUNK_BYTES if size is None or size < 0 else size)
+        if block:
+            self._hasher.update(block)
+        return block
 
 
 class SignatureIndex:
-    """Parsed signatures: whole-file hashes and nucleic section hashes."""
+    """The hash databases, kept on disk and searched without loading them all.
 
-    def __init__(
-        self, hashes: dict[str, list[HashSignature]], nucleic: list[NucleicSignature]
-    ) -> None:
-        self._hashes = hashes
-        self._sections: dict[tuple[str, int], dict[str, list[str]]] = {}
-        for signature in nucleic:
-            key = (signature.algorithm, signature.offset)
-            self._sections.setdefault(key, {}).setdefault(signature.digest, []).append(
-                signature.name
-            )
+    The index is a sorted text file. A lookup reads a few pages from the
+    memory mapped file, so the connector does not need the whole database in
+    memory on a small server.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._handle = path.open("rb")
+        self._map = mmap.mmap(self._handle.fileno(), 0, access=mmap.ACCESS_READ)
+
+    def close(self) -> None:
+        self._map.close()
+        self._handle.close()
+
+    def lookup(self, digest: str) -> list[HashSignature]:
+        """Every signature recorded for one digest."""
+        found: list[HashSignature] = []
+        offset = self._first(digest)
+        while offset is not None:
+            line = self._line(offset)
+            key, _, remainder = line.partition(":")
+            if key != digest:
+                break
+            size, _, name = remainder.partition(":")
+            try:
+                found.append(HashSignature(name=name, size=int(size)))
+            except ValueError:
+                pass
+            offset = self._next(offset)
+        return found
 
     def match(self, stream: BinaryIO, size: int) -> list[Match]:
-        """Match one open file against the signature index.
-
-        The file is read once. Whole-file digests are compared with the .hdb
-        index, and the bytes that start at a recorded offset and continue to the
-        end of the file are compared with the .ndb index. An offset of zero
-        therefore compares the whole file.
-        """
-        whole = {
-            "md5": hashlib.md5(),
-            "sha1": hashlib.sha1(),
-            "sha256": hashlib.sha256(),
-        }
-        jobs = self._section_jobs(size)
-        sections = {job: hashlib.new(job[0]) for job in jobs if job[1] > 0}
-        position = 0
+        """Match one open file against the hash databases."""
+        digests: dict[str, str] = {}
+        for algorithm in ("md5", "sha1", "sha256"):
+            digests[algorithm] = hashlib.new(algorithm)
         while True:
             block = stream.read(CHUNK_BYTES)
             if not block:
                 break
-            end = position + len(block)
-            for hasher in whole.values():
+            for hasher in digests.values():
                 hasher.update(block)
-            for job, hasher in sections.items():
-                start = max(job[1], position)
-                if end > start:
-                    hasher.update(block[start - position :])
-            position = end
-        digests = {algorithm: hasher.hexdigest() for algorithm, hasher in whole.items()}
         matches: list[Match] = []
-        seen: set[tuple[str, str]] = set()
-        for algorithm, digest in digests.items():
-            for signature in self._hashes.get(digest, ()):
+        seen: set[str] = set()
+        for algorithm in ("md5", "sha1", "sha256"):
+            digest = digests[algorithm].hexdigest()
+            for signature in self.lookup(digest):
                 if signature.size not in (0, size):
                     continue
-                key = (signature.name, "hash")
-                if key not in seen:
-                    seen.add(key)
-                    matches.append(Match(signature=signature.name, match_type="hash"))
-        section_digests: dict[tuple[str, int], str] = {}
-        for job, hasher in sections.items():
-            section_digests[job] = hasher.hexdigest()
-        for algorithm, digest in digests.items():
-            if (algorithm, 0) in self._sections:
-                section_digests[(algorithm, 0)] = digest
-        for job, digest in section_digests.items():
-            for name in self._sections.get(job, {}).get(digest, ()):
-                key = (name, "nucleic")
-                if key not in seen:
-                    seen.add(key)
-                    matches.append(Match(signature=name, match_type="nucleic"))
+                if signature.name in seen:
+                    continue
+                seen.add(signature.name)
+                matches.append(Match(signature=signature.name, match_type="hash"))
         return matches
 
-    def _section_jobs(self, size: int) -> list[tuple[str, int]]:
-        """Bounded set of (algorithm, offset) pairs to hash for one file."""
-        offsets = sorted({offset for _, offset in self._sections if offset < size})
-        jobs: list[tuple[str, int]] = []
-        for offset in offsets[:MAX_SECTION_OFFSETS]:
-            for algorithm in HASH_ALGORITHMS.values():
-                if (algorithm, offset) in self._sections:
-                    jobs.append((algorithm, offset))
-        return jobs
+    def _line(self, offset: int) -> str:
+        end = self._map.find(b"\n", offset)
+        if end == -1:
+            end = len(self._map)
+        return self._map[offset:end].decode("utf-8", "replace")
+
+    def _next(self, offset: int) -> int | None:
+        end = self._map.find(b"\n", offset)
+        if end == -1:
+            return None
+        start = end + 1
+        if start >= len(self._map):
+            return None
+        return start
+
+    def _first(self, digest: str) -> int | None:
+        """The offset of the first line whose digest is not smaller."""
+        low = 0
+        high = len(self._map)
+        while low < high:
+            middle = (low + high) // 2
+            start = self._line_start(middle)
+            end = self._map.find(b"\n", start)
+            if end == -1:
+                end = len(self._map)
+            key = self._map[start:end].decode("utf-8", "replace").partition(":")[0]
+            if key < digest:
+                low = end + 1
+            else:
+                high = start
+        if low >= len(self._map):
+            return None
+        start = self._line_start(low)
+        end = self._map.find(b"\n", start)
+        if end == -1:
+            end = len(self._map)
+        key = self._map[start:end].decode("utf-8", "replace").partition(":")[0]
+        return start if key == digest else None
+
+    def _line_start(self, offset: int) -> int:
+        if offset <= 0:
+            return 0
+        start = self._map.rfind(b"\n", 0, offset)
+        return 0 if start == -1 else start + 1
 
 
 class ClamavDatabase:
@@ -265,10 +264,12 @@ class ClamavDatabase:
         directory: Path | None = None,
         *,
         transport: httpx.BaseTransport | None = None,
-        url: str = DATABASE_URL,
+        url: str = CONTAINER_URL,
+        containers: tuple[str, ...] | None = None,
     ) -> None:
         self.directory = Path(directory) if directory is not None else default_directory()
         self.url = url
+        self.containers = containers if containers is not None else configured_containers()
         self._transport = transport
         self._http: httpx.Client | None = None
         self._index: SignatureIndex | None = None
@@ -277,79 +278,66 @@ class ClamavDatabase:
         if self._http is not None:
             self._http.close()
             self._http = None
+        if self._index is not None:
+            self._index.close()
+            self._index = None
 
     def refresh(self, *, force: bool = False) -> None:
-        """Download missing or stale signature files into the private cache.
+        """Download the signature containers and keep the hash databases.
 
         A failed download keeps the cached copy. Only when no usable copy is
         left does the refresh fail.
         """
         self._prepare_directory()
+        metadata = self._metadata()
+        downloaded = metadata.get("downloaded_at")
+        if not force and downloaded and self._is_recent(downloaded):
+            return
         total = 0
-        refreshed = False
-        for name in SIGNATURE_FILES:
-            target = self.directory / name
-            if not force and self._is_current(target):
-                total += self._size(target)
-                continue
+        builds: dict[str, str] = {}
+        for name in self.containers:
+            target = self.directory / f"{name}.tmp"
             try:
                 self._download(name, target)
-                refreshed = True
+                build = self._extract(target, name)
             except (ClamavError, httpx.HTTPError) as exc:
-                if not self._usable(target):
+                target.unlink(missing_ok=True)
+                if not self._has_hash_files():
                     raise ClamavError(
                         f"the ClamAV signature database could not be downloaded: {exc}"
                     ) from None
-            total += self._size(target)
+                continue
+            builds[name] = build
+            total += target.stat().st_size
             if total > MAX_TOTAL_BYTES:
+                target.unlink(missing_ok=True)
                 raise ClamavError("the signature database exceeds the local size limit")
-        if refreshed:
-            self._index = None
+            target.unlink(missing_ok=True)
+        if not builds and not self._has_hash_files():
+            raise ClamavError("the signature database is not available")
+        self._rebuild_index()
+        self._write_metadata(builds)
 
     def index(self) -> SignatureIndex:
-        """Parse the cached signature files once per database instance."""
+        """The hash index, built once per database instance."""
         if self._index is None:
-            hashes: dict[str, list[HashSignature]] = {}
-            nucleic: list[NucleicSignature] = []
-            for name in SIGNATURE_FILES:
-                path = self.directory / name
-                try:
-                    text = path.read_text(errors="replace")
-                except OSError as exc:
-                    raise ClamavError(f"the signature file {name} is missing") from exc
-                if name.endswith(".hdb"):
-                    for digest, signatures in parse_hdb(text).items():
-                        hashes.setdefault(digest, []).extend(signatures)
-                else:
-                    nucleic.extend(parse_ndb(text))
-            if not hashes and not nucleic:
+            path = self.directory / INDEX_NAME
+            if not path.exists():
                 raise ClamavError("the signature database is empty")
-            self._index = SignatureIndex(hashes, nucleic)
+            self._index = SignatureIndex(path)
         return self._index
 
     def status(self) -> dict[str, Any]:
         """Version, timestamp and file count of the cached signature database."""
-        freshest: tuple[str, float] | None = None
-        count = 0
-        for name in SIGNATURE_FILES:
-            path = self.directory / name
-            try:
-                info = path.lstat()
-            except OSError:
-                continue
-            if not stat.S_ISREG(info.st_mode) or info.st_size == 0:
-                continue
-            count += 1
-            if freshest is None or info.st_mtime > freshest[1]:
-                freshest = (name, info.st_mtime)
-        if freshest is None:
+        metadata = self._metadata()
+        version = metadata.get("version")
+        updated = metadata.get("updated_at")
+        if not version or not updated:
             raise ClamavError("the signature database is not available")
-        name, mtime = freshest
-        updated = datetime.fromtimestamp(mtime, UTC).replace(microsecond=0)
         return {
-            "version": f"{name}@{updated.date().isoformat()}",
-            "updated_at": updated.isoformat().replace("+00:00", "Z"),
-            "files": count,
+            "version": version,
+            "updated_at": updated,
+            "files": int(metadata.get("files", 0)),
         }
 
     def _prepare_directory(self) -> None:
@@ -373,75 +361,189 @@ class ClamavDatabase:
             self._http = httpx.Client(
                 follow_redirects=False,
                 trust_env=False,
-                timeout=60,
+                timeout=120,
+                headers={"User-Agent": USER_AGENT},
                 transport=self._transport,
             )
         return self._http
 
-    def _is_current(self, target: Path) -> bool:
-        try:
-            info = target.lstat()
-        except OSError:
-            return False
-        if not stat.S_ISREG(info.st_mode) or info.st_size == 0:
-            return False
-        age = datetime.now(UTC).timestamp() - info.st_mtime
-        return 0 <= age <= REFRESH_INTERVAL.total_seconds()
-
-    def _usable(self, target: Path) -> bool:
-        try:
-            info = target.lstat()
-        except OSError:
-            return False
-        return stat.S_ISREG(info.st_mode) and info.st_size > 0
-
-    def _size(self, target: Path) -> int:
-        try:
-            info = target.lstat()
-        except OSError:
-            return 0
-        return info.st_size if stat.S_ISREG(info.st_mode) else 0
-
     def _download(self, name: str, target: Path) -> None:
         fd, temporary = tempfile.mkstemp(prefix=".clamav-", dir=self.directory)
+        os.close(fd)
+        path = Path(temporary)
         try:
             with self._client().stream("GET", self.url + name) as response:
                 if response.status_code != 200:
                     raise ClamavError(f"the signature download for {name} was refused")
                 expected = response.headers.get("Content-Length")
                 written = 0
-                with os.fdopen(fd, "wb") as stream:
-                    fd = -1
+                with path.open("wb") as stream:
                     for block in response.iter_bytes(65536):
                         written += len(block)
-                        if written > MAX_FILE_BYTES:
-                            raise ClamavError(f"the signature file {name} exceeds the size limit")
+                        if written > MAX_CONTAINER_BYTES:
+                            raise ClamavError(
+                                f"the signature container {name} exceeds the size limit"
+                            )
                         stream.write(block)
                     stream.flush()
                     os.fsync(stream.fileno())
             if expected is not None and written != int(expected):
                 raise ClamavError(f"the signature download for {name} was incomplete")
-            os.chmod(temporary, 0o600)
-            self._validate(Path(temporary), name)
-            if target.is_symlink():
-                target.unlink()
-            os.replace(temporary, target)
+            os.chmod(path, 0o600)
+            target.unlink(missing_ok=True)
+            os.replace(path, target)
         except httpx.HTTPError as exc:
+            path.unlink(missing_ok=True)
             raise ClamavError(f"the signature download for {name} failed") from exc
-        finally:
-            if fd != -1:
-                os.close(fd)
-            Path(temporary).unlink(missing_ok=True)
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
 
-    def _validate(self, path: Path, name: str) -> None:
-        with path.open("rb") as stream:
-            head = stream.read(VALIDATION_BYTES)
-        if not head:
-            raise ClamavError(f"the downloaded {name} file is empty")
-        text = head.decode("utf-8", errors="replace")
-        if name.endswith(".hdb"):
-            valid = _looks_like_hdb(text)
-        else:
-            valid = _looks_like_ndb(text)
-        if not valid:
-            raise ClamavError(f"the downloaded {name} file is not a signature database")
+    def _extract(self, container: Path, container_name: str) -> str:
+        """Extract the hash databases from one container. Returns its build time."""
+        pending: list[tuple[str, Path]] = []
+        try:
+            with container.open("rb") as raw:
+                header = raw.read(HEADER_BYTES)
+                if len(header) < HEADER_BYTES or not header.startswith(b"ClamAV-VDB:"):
+                    raise ClamavError("the signature container has no readable header")
+                fields = header.decode("ascii", "replace").rstrip().split(":")
+                digest = next((field for field in fields if DIGEST_HEX.fullmatch(field)), None)
+                if digest is None:
+                    raise ClamavError("the signature container has no content digest")
+                build = self._build_time(fields)
+                raw.seek(HEADER_BYTES)
+                hasher = hashlib.md5()
+                with gzip.GzipFile(fileobj=_HashingReader(raw, hasher)) as stream:
+                    with tarfile.open(fileobj=stream, mode="r|") as archive:
+                        for member in archive:
+                            if not member.isfile():
+                                continue
+                            name = Path(member.name).name
+                            if not name.endswith(HASH_SUFFIXES):
+                                continue
+                            if member.size > MAX_MEMBER_BYTES:
+                                continue
+                            handle = archive.extractfile(member)
+                            if handle is None:
+                                continue
+                            fd, temporary = tempfile.mkstemp(prefix=".member-", dir=self.directory)
+                            with os.fdopen(fd, "wb") as out:
+                                shutil.copyfileobj(handle, out, CHUNK_BYTES)
+                            pending.append((name, Path(temporary)))
+                if hasher.hexdigest() != digest:
+                    raise ClamavError("the signature container does not match its own digest")
+            for name, temporary in pending:
+                if not _looks_like_hash_database_file(temporary):
+                    raise ClamavError(f"the {name} file is not a hash database")
+                suffix = name.rsplit(".", 1)[-1]
+                target = self.directory / f"{container_name.rsplit('.', 1)[0]}.{suffix}"
+                os.chmod(temporary, 0o600)
+                os.replace(temporary, target)
+        finally:
+            for _name, temporary in pending:
+                temporary.unlink(missing_ok=True)
+        return build
+
+    def _build_time(self, fields: list[str]) -> str:
+        """The build time of the container, as an ISO timestamp."""
+        for field in fields[1:3]:
+            try:
+                moment = datetime.strptime(field.strip(), BUILD_TIME)
+            except ValueError:
+                continue
+            return moment.astimezone(UTC).replace(microsecond=0).isoformat()
+        return datetime.now(UTC).replace(microsecond=0).isoformat()
+
+    def _rebuild_index(self) -> None:
+        """Write the sorted lookup index from the cached hash databases."""
+        lines: list[str] = []
+        for path in sorted(self.directory.glob("*.hdb")) + sorted(self.directory.glob("*.hsb")):
+            with path.open("r", errors="replace") as stream:
+                for line in stream:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if not HASH_LINE.fullmatch(line):
+                        continue
+                    digest, size, name = line.split(":", 2)
+                    lines.append(f"{digest.lower()}:{size}:{name}")
+        if not lines:
+            raise ClamavError("the signature database is empty")
+        lines.sort()
+        target = self.directory / INDEX_NAME
+        fd, temporary = tempfile.mkstemp(prefix=".index-", dir=self.directory)
+        try:
+            with os.fdopen(fd, "w") as stream:
+                stream.writelines(f"{line}\n" for line in lines)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, target)
+        except BaseException:
+            Path(temporary).unlink(missing_ok=True)
+            raise
+
+    def _write(self, target: Path, content: bytes) -> None:
+        fd, temporary = tempfile.mkstemp(prefix=".sig-", dir=self.directory)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, target)
+        except BaseException:
+            Path(temporary).unlink(missing_ok=True)
+            raise
+
+    def _has_hash_files(self) -> bool:
+        return any(self.directory.glob("*.hdb")) or any(self.directory.glob("*.hsb"))
+
+    def _metadata(self) -> dict[str, Any]:
+        path = self.directory / METADATA_NAME
+        try:
+            value = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def _write_metadata(self, builds: dict[str, str]) -> None:
+        metadata = self._metadata()
+        versions = []
+        updated = None
+        for name, build in sorted(builds.items()):
+            versions.append(f"{name}@{build[:10]}")
+            if updated is None or build > updated:
+                updated = build
+        files = len(list(self.directory.glob("*.hdb"))) + len(list(self.directory.glob("*.hsb")))
+        payload = {
+            "version": "+".join(versions) or metadata.get("version", ""),
+            # The build time of the signatures, not the download time.
+            "updated_at": updated or metadata.get("updated_at"),
+            # When the database was fetched. The refresh cadence follows it.
+            "downloaded_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+            "files": files,
+        }
+        target = self.directory / METADATA_NAME
+        fd, temporary = tempfile.mkstemp(prefix=".meta-", dir=self.directory)
+        try:
+            with os.fdopen(fd, "w") as stream:
+                json.dump(payload, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, target)
+        except BaseException:
+            Path(temporary).unlink(missing_ok=True)
+            raise
+
+    def _is_recent(self, updated: str) -> bool:
+        try:
+            moment = datetime.fromisoformat(updated)
+        except ValueError:
+            return False
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=UTC)
+        age = datetime.now(UTC) - moment.astimezone(UTC)
+        return timedelta(0) <= age <= REFRESH_INTERVAL

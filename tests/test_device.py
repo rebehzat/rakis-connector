@@ -7,8 +7,9 @@ import re
 
 import httpx
 import pytest
+from conftest import write_cache
 
-from acsc_cli import clamav, device
+from acsc_cli import device
 from acsc_cli.clamav import ClamavDatabase
 
 SAMPLE = b"synthetic-malware-fixture"
@@ -22,12 +23,10 @@ def _refuse(*args, **kwargs):
 
 def _database(tmp_path, sample: bytes = SAMPLE) -> ClamavDatabase:
     """A cached signature database that holds one known sample."""
-    directory = tmp_path / "cache"
-    directory.mkdir(exist_ok=True)
     digest = hashlib.md5(sample).hexdigest()
-    (directory / "daily.hdb").write_text(f"{digest}:{len(sample)}:Example.Malware.A\n")
-    for name in ("daily.ndb", "main.hdb", "main.ndb"):
-        (directory / name).write_text(f"Example:0:MD5,0,{'b' * 32}\n")
+    directory = write_cache(
+        tmp_path / "cache", {"daily.hdb": f"{digest}:{len(sample)}:Example.Malware.A\n"}
+    )
     return ClamavDatabase(directory, transport=httpx.MockTransport(_refuse))
 
 
@@ -80,7 +79,7 @@ def test_the_report_matches_the_agent_contract(tmp_path):
     }
     assert set(report["signature_db"]) == {"version", "updated_at", "files"}
     assert 1 <= len(report["signature_db"]["version"]) <= 128
-    assert report["signature_db"]["files"] == 4
+    assert report["signature_db"]["files"] == 1
     assert 0 <= report["files_scanned"] <= 10000000
     assert 0 <= report["directories_scanned"] <= 100000
     assert 0 <= report["skipped_files"] <= 1000000
@@ -192,4 +191,4 @@ def test_the_scan_uses_the_cached_database_without_a_download(tmp_path):
     database = _database(tmp_path)
     database.refresh()
     assert list((tmp_path / "cache").iterdir())
-    assert clamav.SIGNATURE_FILES[0] in [path.name for path in (tmp_path / "cache").iterdir()]
+    assert "daily.hdb" in [path.name for path in (tmp_path / "cache").iterdir()]

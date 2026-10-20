@@ -20,6 +20,10 @@ from acsc_cli.configuration import inspect
 from acsc_cli.device import MAX_ROOTS
 from acsc_cli.device import scan as device_scan
 
+# The device scan hashes every chosen file. It repeats on its own slower
+# cadence so a background connector does not keep a busy server busy.
+DEVICE_RESCAN_SECONDS = 600
+
 
 def _interval(value: str) -> int:
     try:
@@ -193,6 +197,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(client.device_scan(device_report)), flush=True)
             else:
                 device_report = None
+            last_device_scan = time.monotonic()
             while args.command == "run" or args.watch:
                 time.sleep(args.interval)
                 print(json.dumps(client.heartbeat()), flush=True)
@@ -204,8 +209,14 @@ def main(argv: list[str] | None = None) -> int:
                             flush=True,
                         )
                         observations = current
-                if cfg.device_paths:
+                if (
+                    cfg.device_paths
+                    and time.monotonic() - last_device_scan >= DEVICE_RESCAN_SECONDS
+                ):
+                    # Hashing every chosen file is work for the server. The
+                    # device scan repeats on its own slower cadence.
                     current = device_scan(cfg.device_paths, database)
+                    last_device_scan = time.monotonic()
                     if current != device_report:
                         print(json.dumps(client.device_scan(current)), flush=True)
                         device_report = current

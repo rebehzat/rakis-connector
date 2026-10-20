@@ -88,10 +88,13 @@ rakis background start
 
 Repeat `--device-path` for up to sixteen files or folders. `--device-path` and
 `--config-root` can be used together. The connector downloads the ClamAV
-signature database itself into a private local cache
-(`~/.cache/rakis/clamav/`, readable only by your account) and refreshes it at
-most once a day. Your server does not need ClamAV installed and the
-connector never sends anything to a third party for scanning.
+signature containers itself into a private local cache
+(`~/.cache/rakis/clamav/`, readable only by your account) and refreshes them
+at most once a day. Your server does not need ClamAV installed and the
+connector never sends anything to a third party for scanning. Set
+`RAKIS_CLAMAV_DATABASE=daily` to keep only the smaller daily container. The
+first refresh downloads about 110 MB and needs roughly 200 MB of free memory;
+after that the cache stays around 40 MB.
 
 To run a one-off device scan:
 
@@ -114,14 +117,16 @@ connector never deletes, quarantines or repairs a file. Detections appear in
 the dashboard.
 
 **Coverage limitation:** the connector matches whole-file hashes (MD5, SHA1 and
-SHA256) and nucleic section hashes against the signature database. It does not
-evaluate ClamAV bytecode (`.cvd`/`.cld`) signatures, does not match `.ftm` magic
-files, does not unpack archives, does not run heuristic or behavioural analysis
-and does not use a `clamd` daemon. A file that only matches a bytecode, magic
-or heuristic signature is not reported, so a clean device scan is not proof that
+SHA256) against the hash databases inside the signature containers. It does not
+evaluate ClamAV's pattern, logical or bytecode engines, does not match section
+hashes, does not unpack archives, does not run heuristic or behavioural
+analysis and does not use a `clamd` daemon. A file that only matches a pattern
+or bytecode signature is not reported, so a clean device scan is not proof that
 the server is free of malware. Files that are links, special files, too large,
 unreadable or outside the chosen paths stay outside the coverage, and the
-report then marks the coverage as partial.
+report then marks the coverage as partial. The publisher signature of a
+signature container is not verified: the MD5 that the container records over
+its own payload is checked instead, and the download uses HTTPS.
 
 ## Check or stop
 

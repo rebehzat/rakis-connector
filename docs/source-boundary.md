@@ -10,10 +10,9 @@ connector's user service. Optional AI flags request server-side review; this
 repository contains no prompts, provider credentials, model selection, agent
 orchestration or server analysis logic.
 
-The device protection code downloads the public ClamAV signature database to a
-private local cache and matches whole-file hashes and nucleic section hashes.
-It carries no server analysis pipeline, no detection heuristic and no customer
-data.
+The device protection code downloads the public ClamAV signature containers to a
+private local cache and matches whole-file hashes against them. It carries no
+server analysis pipeline, no detection heuristic and no customer data.
 
 Before updating public source, review every added file for secrets, customer data
 and server implementation details. Test fixture credentials must remain obviously
