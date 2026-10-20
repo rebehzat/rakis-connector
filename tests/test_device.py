@@ -124,6 +124,76 @@ def test_the_filesystem_root_and_runtime_roots_are_refused(tmp_path):
         device.scan([str(link)], database)
 
 
+@pytest.mark.parametrize(
+    "path", ["/tmp/..", "/tmp/../proc", "/tmp/../sys", "//", "//tmp/..", "//proc"]
+)
+def test_dot_segments_cannot_bypass_the_root_boundary(tmp_path, monkeypatch, path):
+    database = _database(tmp_path)
+    monkeypatch.setattr(
+        device.os, "fwalk", lambda *args, **kwargs: pytest.fail("forbidden root reached walk")
+    )
+    with pytest.raises(ValueError, match="filesystem root and system runtime roots"):
+        device.scan([path], database)
+
+
+def test_a_symlink_parent_cannot_be_hidden_by_dot_segments(tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+    database = _database(tmp_path)
+    with pytest.raises(ValueError, match="symlink parents"):
+        device.scan([f"{link}/.."], database)
+
+
+def test_safe_dot_segments_are_normalized_before_scanning(tmp_path):
+    root = tmp_path / "chosen"
+    root.mkdir()
+    (root / "child").mkdir()
+    (root / "sample.bin").write_bytes(SAMPLE)
+    database = _database(tmp_path)
+    report = device.scan([f"{root}/child/.."], database)
+    assert report["files_scanned"] == 1
+    assert report["detections"][0]["path"] == "root-1/sample.bin"
+
+
+def test_an_oversized_file_root_is_skipped(tmp_path, monkeypatch):
+    root = tmp_path / "sample.bin"
+    root.write_bytes(SAMPLE)
+    database = _database(tmp_path)
+    monkeypatch.setattr(device, "MAX_FILE_BYTES", len(SAMPLE) - 1)
+    report = device.scan([str(root)], database)
+    assert report["files_scanned"] == 0
+    assert report["skipped_files"] == 1
+    assert report["detections"] == []
+    assert report["complete"] is False
+
+
+def test_file_roots_share_the_total_read_limit(tmp_path, monkeypatch):
+    roots = [tmp_path / "first.bin", tmp_path / "second.bin"]
+    for root in roots:
+        root.write_bytes(SAMPLE)
+    database = _database(tmp_path)
+    monkeypatch.setattr(device, "MAX_READ_BYTES", len(SAMPLE))
+    report = device.scan([str(root) for root in roots], database)
+    assert report["files_scanned"] == 1
+    assert report["skipped_files"] == 1
+    assert len(report["detections"]) == 1
+    assert report["complete"] is False
+
+
+def test_a_hardlinked_file_root_is_skipped(tmp_path):
+    root = tmp_path / "sample.bin"
+    root.write_bytes(SAMPLE)
+    os.link(root, tmp_path / "other.bin")
+    database = _database(tmp_path)
+    report = device.scan([str(root)], database)
+    assert report["files_scanned"] == 0
+    assert report["skipped_files"] == 1
+    assert report["detections"] == []
+    assert report["complete"] is False
+
+
 def test_too_many_paths_are_refused(tmp_path):
     database = _database(tmp_path)
     with pytest.raises(ValueError):

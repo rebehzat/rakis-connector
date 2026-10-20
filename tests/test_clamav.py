@@ -158,6 +158,25 @@ def test_a_failed_download_keeps_the_cached_copy(tmp_path):
     database.close()
 
 
+def test_a_refreshed_database_replaces_the_open_lookup_index(tmp_path):
+    directory = write_cache(tmp_path / "cache", {"daily.hdb": hash_entry("a" * 32, 4)})
+    database = ClamavDatabase(
+        directory,
+        containers=("daily.cvd",),
+        transport=httpx.MockTransport(
+            container_handler({"daily.hdb": hash_entry(DIGEST, len(SAMPLE))})
+        ),
+    )
+    try:
+        assert database.index().match(_stream(SAMPLE), len(SAMPLE)) == []
+        database.refresh(force=True)
+        assert database.index().match(_stream(SAMPLE), len(SAMPLE)) == [
+            Match(signature="Example.Malware.A", match_type="hash")
+        ]
+    finally:
+        database.close()
+
+
 def test_an_oversized_container_is_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(clamav, "MAX_CONTAINER_BYTES", 64)
     database = _database(

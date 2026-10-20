@@ -58,12 +58,17 @@ def scan(paths: list[str], database: ClamavDatabase | None = None) -> dict[str, 
             raise ValueError(f"device path cannot be read: {exc.strerror}") from None
         if stat.S_ISLNK(info.st_mode):
             raise ValueError("device paths cannot be symlinks")
+        # Check the original path before collapsing dot segments, so a symlink
+        # such as chosen/link/.. cannot disappear from the boundary check.
+        if any(parent.is_symlink() for parent in root.parents):
+            raise ValueError("device paths cannot contain symlink parents")
+        root = Path(os.path.abspath(root))
+        # Normalize a preserved double slash prefix to the same POSIX boundary.
+        root = Path("/" + root.as_posix().lstrip("/"))
         if root == Path("/") or any(
             root == system or system in root.parents for system in SYSTEM_ROOTS
         ):
             raise ValueError("the filesystem root and system runtime roots cannot be scanned")
-        if any(parent.is_symlink() for parent in root.parents):
-            raise ValueError("device paths cannot contain symlink parents")
 
         if stat.S_ISDIR(info.st_mode):
 
@@ -140,6 +145,13 @@ def scan(paths: list[str], database: ClamavDatabase | None = None) -> dict[str, 
                         detections, seen, skipped, label, child.st_size, matches
                     )
         elif stat.S_ISREG(info.st_mode):
+            if (
+                info.st_nlink != 1
+                or info.st_size > MAX_FILE_BYTES
+                or read_bytes + info.st_size > MAX_READ_BYTES
+            ):
+                skipped += 1
+                continue
             label = _label(number, root.name)
             if label is None:
                 skipped += 1

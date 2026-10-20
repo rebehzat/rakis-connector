@@ -188,19 +188,17 @@ class SignatureIndex:
 
     def match(self, stream: BinaryIO, size: int) -> list[Match]:
         """Match one open file against the hash databases."""
-        digests: dict[str, str] = {}
-        for algorithm in ("md5", "sha1", "sha256"):
-            digests[algorithm] = hashlib.new(algorithm)
+        hashers = {algorithm: hashlib.new(algorithm) for algorithm in ("md5", "sha1", "sha256")}
         while True:
             block = stream.read(CHUNK_BYTES)
             if not block:
                 break
-            for hasher in digests.values():
+            for hasher in hashers.values():
                 hasher.update(block)
         matches: list[Match] = []
         seen: set[str] = set()
         for algorithm in ("md5", "sha1", "sha256"):
-            digest = digests[algorithm].hexdigest()
+            digest = hashers[algorithm].hexdigest()
             for signature in self.lookup(digest):
                 if signature.size not in (0, size):
                     continue
@@ -433,16 +431,16 @@ class ClamavDatabase:
                             pending.append((name, Path(temporary)))
                 if hasher.hexdigest() != digest:
                     raise ClamavError("the signature container does not match its own digest")
-            for name, temporary in pending:
-                if not _looks_like_hash_database_file(temporary):
+            for name, member_path in pending:
+                if not _looks_like_hash_database_file(member_path):
                     raise ClamavError(f"the {name} file is not a hash database")
                 suffix = name.rsplit(".", 1)[-1]
                 target = self.directory / f"{container_name.rsplit('.', 1)[0]}.{suffix}"
-                os.chmod(temporary, 0o600)
-                os.replace(temporary, target)
+                os.chmod(member_path, 0o600)
+                os.replace(member_path, target)
         finally:
-            for _name, temporary in pending:
-                temporary.unlink(missing_ok=True)
+            for _name, cleanup_path in pending:
+                cleanup_path.unlink(missing_ok=True)
         return build
 
     def _build_time(self, fields: list[str]) -> str:
@@ -480,6 +478,11 @@ class ClamavDatabase:
                 os.fsync(stream.fileno())
             os.chmod(temporary, 0o600)
             os.replace(temporary, target)
+            # A running connector keeps this database instance between scans.
+            # Reopen the mapping after replacement so it uses the new signatures.
+            if self._index is not None:
+                self._index.close()
+                self._index = None
         except BaseException:
             Path(temporary).unlink(missing_ok=True)
             raise
