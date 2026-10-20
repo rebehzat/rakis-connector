@@ -1,3 +1,3 @@
 """Rakis server connector. Public client only; no scan or host control."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

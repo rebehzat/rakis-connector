@@ -10,7 +10,7 @@ server's workloads.
 Requires Python 3.12+ and [pipx](https://pipx.pypa.io/stable/installation/).
 
 ```sh
-pipx install https://github.com/rebehzat/rakis-connector/releases/download/v0.3.0/rakis_connector-0.3.0-py3-none-any.whl
+pipx install https://github.com/rebehzat/rakis-connector/releases/download/v0.4.0/rakis_connector-0.4.0-py3-none-any.whl
 ```
 
 If you already installed the connector, use `pipx install --force` with the same
@@ -75,6 +75,58 @@ This can retry an incomplete AI review after the service is restored. Reviews th
 are already queued, running or successful remain deduplicated. Background checks
 never automatically retry incomplete AI, so unchanged observations do not repeatedly
 spend tokens. A one-time `scan --ai` does not enable AI for future background checks.
+
+## Optional device protection
+
+Enable **Include device protection scanning** when creating the key, then
+choose the files and folders to check:
+
+```sh
+rakis connect --api-url https://api.rakis.com.tr --device-path /srv/www
+rakis background start
+```
+
+Repeat `--device-path` for up to sixteen files or folders. `--device-path` and
+`--config-root` can be used together. The connector downloads the ClamAV
+signature containers itself into a private local cache
+(`~/.cache/rakis/clamav/`, readable only by your account) and refreshes them
+at most once a day. Your server does not need ClamAV installed and the
+connector never sends anything to a third party for scanning. Set
+`RAKIS_CLAMAV_DATABASE=daily` to keep only the smaller daily container. The
+first refresh downloads about 110 MB and needs roughly 200 MB of free memory;
+after that the cache stays around 40 MB.
+
+To run a one-off device scan:
+
+```sh
+rakis device scan --path /srv/www
+rakis device scan --path /srv/www --path /home/me/downloads
+```
+
+Without `--path` the saved device paths are used. The command prints a short
+summary: files scanned, detections and the signature database version. The
+background connector repeats the device scan next to the configuration check
+and uploads a new report only when the report changed.
+
+The connector reads only files your account can read, never follows links and
+never leaves the chosen paths. Rakis receives the signature name, a relative
+path label such as `root-1/www/shell.php`, the file size, the match type and
+the coverage counters. File content, file hashes and the list of scanned files
+never leave the server; only the names of the known-bad signatures do. The
+connector never deletes, quarantines or repairs a file. Detections appear in
+the dashboard.
+
+**Coverage limitation:** the connector matches whole-file hashes (MD5, SHA1 and
+SHA256) against the hash databases inside the signature containers. It does not
+evaluate ClamAV's pattern, logical or bytecode engines, does not match section
+hashes, does not unpack archives, does not run heuristic or behavioural
+analysis and does not use a `clamd` daemon. A file that only matches a pattern
+or bytecode signature is not reported, so a clean device scan is not proof that
+the server is free of malware. Files that are links, special files, too large,
+unreadable or outside the chosen paths stay outside the coverage, and the
+report then marks the coverage as partial. The publisher signature of a
+signature container is not verified: the MD5 that the container records over
+its own payload is checked instead, and the download uses HTTPS.
 
 ## Check or stop
 

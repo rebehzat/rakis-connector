@@ -66,7 +66,15 @@ def build() -> Path:
                 "filename": result.name,
                 "sha256": digest,
                 "requires_python": project["requires-python"],
-                "commands": ["connect", "run", "background", "scan", "status", "disconnect"],
+                "commands": [
+                    "connect",
+                    "run",
+                    "background",
+                    "scan",
+                    "device",
+                    "status",
+                    "disconnect",
+                ],
             },
             indent=2,
         )

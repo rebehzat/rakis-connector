@@ -27,6 +27,7 @@ class Config(BaseModel):
     token: SecretStr
     allow_local_http: bool = False
     config_roots: list[str] = Field(default_factory=list, max_length=8)
+    device_paths: list[str] = Field(default_factory=list, max_length=16)
     ai_configuration: StrictBool = False
 
     @field_validator("token")
@@ -114,6 +115,7 @@ def save(path: Path, config: Config) -> None:
                     "token": config.token.get_secret_value(),
                     "allow_local_http": config.allow_local_http,
                     "config_roots": config.config_roots,
+                    "device_paths": config.device_paths,
                     "ai_configuration": config.ai_configuration,
                 },
                 stream,

@@ -13,9 +13,16 @@ from pathlib import Path
 from pydantic import SecretStr
 
 from acsc_cli.background import BackgroundError, manage, stop_if_installed
+from acsc_cli.clamav import ClamavDatabase, ClamavError
 from acsc_cli.client import Client, ClientError
 from acsc_cli.config import Config, disconnect, load, save
 from acsc_cli.configuration import inspect
+from acsc_cli.device import MAX_ROOTS
+from acsc_cli.device import scan as device_scan
+
+# The device scan hashes every chosen file. It repeats on its own slower
+# cadence so a background connector does not keep a busy server busy.
+DEVICE_RESCAN_SECONDS = 600
 
 
 def _interval(value: str) -> int:
@@ -51,6 +58,12 @@ def main(argv: list[str] | None = None) -> int:
         help="opt in to read-only local configuration checks in this folder",
     )
     connect.add_argument(
+        "--device-path",
+        action="append",
+        default=[],
+        help="opt in to local malware signature checks for this file or folder",
+    )
+    connect.add_argument(
         "--watch", action="store_true", help="keep the connection alive until stopped"
     )
     connect.add_argument("--interval", type=_interval, default=60)
@@ -63,6 +76,19 @@ def main(argv: list[str] | None = None) -> int:
     scan.add_argument(
         "--ai", action="store_true", help="request AI review of safe warnings for this check"
     )
+    device = sub.add_parser(
+        "device", help="device protection with a local malware signature database"
+    )
+    device_commands = device.add_subparsers(dest="device_command", required=True)
+    device_scan_parser = device_commands.add_parser(
+        "scan", help="scan chosen files and folders for known malware signatures"
+    )
+    device_scan_parser.add_argument(
+        "--path",
+        action="append",
+        default=[],
+        help="file or folder to scan; repeat for more than one",
+    )
     run = sub.add_parser("run", help="keep a saved connection alive in the foreground")
     run.add_argument("--interval", type=_interval, default=60)
     background = sub.add_parser("background", help="manage your non-root background connector")
@@ -72,6 +98,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("disconnect", help="remove the local token; revoke it in the dashboard")
     args = parser.parse_args(argv)
     client = None
+    database = None
     try:
         if args.command == "background":
             print(json.dumps(manage(args.action, args.config, args.interval)))
@@ -93,6 +120,36 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 0
+        if args.command == "device":
+            cfg = load(args.config, use_environment=False)
+            paths = args.path or cfg.device_paths
+            if not paths:
+                raise BackgroundError(
+                    "Select device paths first with connect --device-path "
+                    "or rakis device scan --path"
+                )
+            if len(paths) > MAX_ROOTS:
+                raise BackgroundError("Choose at most sixteen device paths")
+            database = ClamavDatabase()
+            report = device_scan(paths, database)
+            client = Client(cfg)
+            result = client.device_scan(report)
+            print(
+                json.dumps(
+                    {
+                        "job_id": result["job_id"],
+                        "status": result["status"],
+                        "changed": result["changed"],
+                        "files_scanned": report["files_scanned"],
+                        "directories_scanned": report["directories_scanned"],
+                        "skipped_files": report["skipped_files"],
+                        "complete": report["complete"],
+                        "detections": len(report["detections"]),
+                        "signature_db_version": report["signature_db"]["version"],
+                    }
+                )
+            )
+            return 0
         if args.command == "disconnect":
             stop_if_installed(args.config)
             disconnect(args.config)
@@ -104,6 +161,8 @@ def main(argv: list[str] | None = None) -> int:
                     raise BackgroundError(
                         "AI review requires a chosen folder: use --config-root with --ai"
                     )
+                if len(args.device_path) > MAX_ROOTS:
+                    raise BackgroundError("Choose at most sixteen device paths")
                 credential = SecretStr(
                     os.environ.get("RAKIS_CONNECT_TOKEN")
                     or getpass.getpass("Server connection token: ")
@@ -113,6 +172,7 @@ def main(argv: list[str] | None = None) -> int:
                     token=credential,
                     allow_local_http=args.allow_local_http,
                     config_roots=args.config_root,
+                    device_paths=args.device_path,
                     ai_configuration=args.ai,
                 )
             else:
@@ -131,6 +191,13 @@ def main(argv: list[str] | None = None) -> int:
                     json.dumps(client.configuration(observations, ai=cfg.ai_configuration)),
                     flush=True,
                 )
+            if cfg.device_paths:
+                database = ClamavDatabase()
+                device_report = device_scan(cfg.device_paths, database)
+                print(json.dumps(client.device_scan(device_report)), flush=True)
+            else:
+                device_report = None
+            last_device_scan = time.monotonic()
             while args.command == "run" or args.watch:
                 time.sleep(args.interval)
                 print(json.dumps(client.heartbeat()), flush=True)
@@ -142,6 +209,17 @@ def main(argv: list[str] | None = None) -> int:
                             flush=True,
                         )
                         observations = current
+                if (
+                    cfg.device_paths
+                    and time.monotonic() - last_device_scan >= DEVICE_RESCAN_SECONDS
+                ):
+                    # Hashing every chosen file is work for the server. The
+                    # device scan repeats on its own slower cadence.
+                    current = device_scan(cfg.device_paths, database)
+                    last_device_scan = time.monotonic()
+                    if current != device_report:
+                        print(json.dumps(client.device_scan(current)), flush=True)
+                        device_report = current
             return 0
         client = Client(load(args.config))
         print(json.dumps(client.status()))
@@ -149,6 +227,9 @@ def main(argv: list[str] | None = None) -> int:
     except ClientError as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
         return exc.code
+    except ClamavError as exc:
+        print(json.dumps({"error": str(exc)}), file=sys.stderr)
+        return 2
     except (OSError, ValueError, EOFError) as exc:
         print(
             json.dumps(
@@ -166,3 +247,5 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if client:
             client.close()
+        if database:
+            database.close()

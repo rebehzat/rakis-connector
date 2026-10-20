@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
@@ -57,7 +58,12 @@ class Client:
         self.http.close()
 
     def _request(
-        self, method: str, path: str, *, observation: bool = False, **kwargs: Any
+        self,
+        method: str,
+        path: str,
+        *,
+        validator: Callable[[Any], dict[str, Any]] = _connection,
+        **kwargs: Any,
     ) -> dict[str, Any]:
         try:
             with self.http.stream(method, path, **kwargs) as response:
@@ -73,12 +79,12 @@ class Client:
                     if len(raw) > 16384:
                         raise ClientError(4, "Connection response exceeds limit")
                 value = json.loads(raw)
-                if observation:
-                    return _inspection(value)
-                result = _connection(value)
-                result["name"] = result["name"].replace(
-                    self.http.headers["Authorization"][7:], "[redacted]"
-                )
+                result = validator(value)
+                name = result.get("name")
+                if isinstance(name, str):
+                    result["name"] = name.replace(
+                        self.http.headers["Authorization"][7:], "[redacted]"
+                    )
                 return result
         except (httpx.HTTPError, ValueError):
             raise ClientError(4, "Dashboard unavailable or invalid response") from None
@@ -94,7 +100,7 @@ class Client:
         return self._request(
             "POST",
             "/agent/v1/configuration",
-            observation=True,
+            validator=_inspection,
             json={
                 "agent_version": __version__,
                 **observations,
@@ -103,8 +109,79 @@ class Client:
             },
         )
 
+    def device_scan(self, report: dict[str, Any]) -> dict[str, Any]:
+        """Upload one device scan. Only signatures and coverage counters leave."""
+        try:
+            payload = {
+                "agent_version": __version__,
+                "engine": "clamav",
+                "signature_db": report["signature_db"],
+                "files_scanned": report["files_scanned"],
+                "directories_scanned": report["directories_scanned"],
+                "skipped_files": report["skipped_files"],
+                "complete": report["complete"],
+                "detections": report["detections"],
+            }
+        except (KeyError, TypeError):
+            raise ClientError(4, "Invalid device scan report") from None
+        return self._request("POST", "/agent/v1/device-scan", validator=_device_scan, json=payload)
+
     def status(self) -> dict[str, Any]:
         return self._request("GET", "/agent/v1/connection")
+
+
+def _device_scan(value: Any) -> dict[str, Any]:
+    """Validate the device scan response. It holds counters, never content."""
+    try:
+        if not isinstance(value, dict):
+            raise ValueError()
+        if not isinstance(value.get("job_id"), str):
+            raise ValueError()
+        uuid.UUID(value["job_id"])
+        if not isinstance(value.get("status"), str) or not 1 <= len(value["status"]) <= 32:
+            raise ValueError()
+        if type(value.get("changed")) is not bool:
+            raise ValueError()
+        if type(value.get("complete")) is not bool:
+            raise ValueError()
+        if value.get("engine") != "clamav":
+            raise ValueError()
+        for key in ("files_scanned", "directories_scanned", "skipped_files"):
+            if type(value.get(key)) is not int or not 0 <= value[key] <= 10000000:
+                raise ValueError()
+        detections = value.get("detections_count")
+        if type(detections) is not int or not 0 <= detections <= 500:
+            raise ValueError()
+        version = value.get("signature_db_version")
+        if not isinstance(version, str) or not 1 <= len(version) <= 128:
+            raise ValueError()
+        for key in ("checked_at", "signature_db_updated_at"):
+            timestamp = value.get(key)
+            if timestamp is None:
+                continue
+            if not isinstance(timestamp, str) or len(timestamp) > 64:
+                raise ValueError()
+            if datetime.fromisoformat(timestamp).tzinfo is None:
+                raise ValueError()
+    except (ValueError, TypeError):
+        raise ClientError(4, "Invalid device scan response") from None
+    return {
+        key: value.get(key)
+        for key in (
+            "job_id",
+            "status",
+            "checked_at",
+            "files_scanned",
+            "directories_scanned",
+            "skipped_files",
+            "complete",
+            "engine",
+            "detections_count",
+            "signature_db_version",
+            "signature_db_updated_at",
+            "changed",
+        )
+    }
 
 
 def _inspection(value: Any) -> dict[str, Any]:
